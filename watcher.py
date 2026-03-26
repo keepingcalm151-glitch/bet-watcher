@@ -16,8 +16,13 @@ CONFIG_PATH = "config.json"\
 STATE_PATH = "state.json"\
 \
 # 1. \uc0\u1047 \u1072 \u1075 \u1088 \u1091 \u1079 \u1082 \u1072  \u1082 \u1086 \u1085 \u1092 \u1080 \u1075 \u1091 \u1088 \u1072 \u1094 \u1080 \u1080 \
-with open(CONFIG_PATH, "r", encoding="utf-8") as f:\
-    config = json.load(f)\
+if os.getenv("CONFIG_JSON"):\
+    # \uc0\u1041 \u1077 \u1088 \u1105 \u1084  \u1082 \u1086 \u1085 \u1092 \u1080 \u1075  \u1080 \u1079  \u1087 \u1077 \u1088 \u1077 \u1084 \u1077 \u1085 \u1085 \u1086 \u1081  \u1086 \u1082 \u1088 \u1091 \u1078 \u1077 \u1085 \u1080 \u1103  (\u1085 \u1072  Railway)\
+    config = json.loads(os.getenv("CONFIG_JSON"))\
+else:\
+    # \uc0\u1056 \u1077 \u1079 \u1077 \u1088 \u1074 \u1085 \u1099 \u1081  \u1074 \u1072 \u1088 \u1080 \u1072 \u1085 \u1090  \'96 \u1080 \u1079  \u1092 \u1072 \u1081 \u1083 \u1072  (\u1077 \u1089 \u1083 \u1080  \u1090 \u1099  \u1079 \u1072 \u1087 \u1091 \u1089 \u1082 \u1072 \u1077 \u1096 \u1100  \u1083 \u1086 \u1082 \u1072 \u1083 \u1100 \u1085 \u1086  \u1091  \u1089 \u1077 \u1073 \u1103 )\
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:\
+        config = json.load(f)\
 \
 OPENAI_API_KEY = config["openai_api_key"]\
 TELEGRAM_BOT_TOKEN = config["telegram_bot_token"]\
