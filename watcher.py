@@ -4,6 +4,7 @@ import json
 import os
 import hashlib
 import requests
+from bs4 import BeautifulSoup
 
 CONFIG_PATH = "config.json"
 STATE_PATH = "state.json"
@@ -119,6 +120,41 @@ def call_openai_diff(old_html: str, new_html: str, site_name: str, site_url: str
         return result["choices"][0]["message"]["content"]
     except Exception:
         return "Не удалось корректно разобрать ответ модели."
+        
+def parse_bettingexpert_profile(html: str, site_name: str, site_url: str) -> dict:
+    """
+    Простая версия парсера профиля bettingexpert.
+    Пока достаём:
+      - имя профиля (из шапки),
+      - общее количество tips (Overall stats → Tips).
+    Потом заменим на реальные Dyole Tips.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Имя профиля (сверху, рядом с Avatar)
+    title_text = site_name
+
+    # Поиск секции "Overall stats" и числа Tips
+    tips_count = None
+    overall_header = soup.find(lambda tag: tag.name in ["h3", "h2"] and "Overall stats" in tag.get_text(strip=True))
+    if overall_header:
+        # Ищем рядом число Tips
+        # На bettingexpert текст "Tips" идёт как подпись под числом
+        tips_label = soup.find(lambda tag: tag.name in ["div", "span", "p"] and "Tips" in tag.get_text(strip=True))
+        if tips_label:
+            # Берём предыдущий элемент, который содержит число
+            prev = tips_label.find_previous(lambda tag: tag.name in ["div", "span", "p"] and tag.get_text(strip=True).isdigit())
+            if prev:
+                try:
+                    tips_count = int(prev.get_text(strip=True))
+                except ValueError:
+                    tips_count = None
+
+    return {
+        "profile_name": title_text,
+        "profile_url": site_url,
+        "tips_count": tips_count
+    }
 
 # 4. Основная логика проверки сайтов
 
@@ -139,6 +175,12 @@ def check_sites_once():
             print(f"[ERROR] Не удалось скачать {url}: {e}")
             continue
 
+        # Новый код: парсим профиль, если это bettingexpert
+        parsed_profile = None
+        if site.get("source") == "bettingexpert":
+            parsed_profile = parse_bettingexpert_profile(new_html, name, url)
+            print(f"[INFO] Профиль: {parsed_profile.get('profile_name')} — Tips: {parsed_profile.get('tips_count')}")
+
         new_hash = calc_hash(new_html)
         old_entry = state.get(key)
 
@@ -146,7 +188,8 @@ def check_sites_once():
             print(f"[INFO] Для {url} ещё нет сохранённой версии. Сохраняю впервые.")
             state[key] = {
                 "hash": new_hash,
-                "html": new_html
+                "html": new_html,
+                "tips_count": parsed_profile.get("tips_count") if parsed_profile else None
             }
             continue
 
@@ -173,7 +216,8 @@ def check_sites_once():
 
         state[key] = {
             "hash": new_hash,
-            "html": new_html
+            "html": new_html,
+            "tips_count": parsed_profile.get("tips_count") if parsed_profile else None
         }
 
     save_state(state)
