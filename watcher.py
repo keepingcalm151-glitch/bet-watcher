@@ -156,6 +156,95 @@ def parse_bettingexpert_profile(html: str, site_name: str, site_url: str) -> dic
         "tips_count": tips_count
     }
     
+def parse_bettingexpert_tips(html: str, profile_name: str) -> list[dict]:
+    """
+    Парсер блока 'XXX Tips' на bettingexpert для профиля.
+
+    Возвращает список словарей:
+    [
+      {
+        "match": "...",
+        "selection": "...",
+        "odds": 1.93,
+        "author": "Имя профиля"
+      },
+      ...
+    ]
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    tips = []
+
+    # Ищем заголовок вида "Dyole Tips", "Pacopick Tips" и т.п.
+    header = soup.find(
+        lambda tag: tag.name in ["h2", "h3", "h4"]
+        and tag.get_text(strip=True).endswith("Tips")
+        and profile_name.split()[0] in tag.get_text(strip=True)
+    )
+
+    if not header:
+        # fallback: любой заголовок, который оканчивается на "Tips"
+        header = soup.find(
+            lambda tag: tag.name in ["h2", "h3", "h4"]
+            and tag.get_text(strip=True).endswith("Tips")
+        )
+
+    if not header:
+        return tips  # Не нашли блок с Tips
+
+    # Берём контейнер после заголовка
+    tips_container = header.find_next(
+        lambda tag: tag.name in ["div", "section", "ul", "ol"]
+    )
+    if not tips_container:
+        return tips
+
+    # Ищем "карточки" ставок: элементы, где в тексте есть " vs "
+    tip_blocks = tips_container.find_all(
+        lambda tag: tag.name in ["div", "article", "li"]
+        and " vs " in tag.get_text(" ", strip=True)
+    )
+
+    for block in tip_blocks:
+        text = block.get_text(" ", strip=True)
+
+        # Пытаемся выдрать матч по " vs "
+        match = None
+        if " vs " in text:
+            parts = text.split(" vs ")
+            left = parts[0].split()
+            right = parts[1].split()
+            # Берём по несколько слов слева и справа
+            left_part = " ".join(left[-3:])
+            right_part = " ".join(right[:3])
+            match = (left_part + " vs " + right_part).strip()
+
+        # Находим коэффициент как первое float-число с точкой
+        odds = None
+        for token in text.replace(",", ".").split():
+            try:
+                val = float(token)
+                if 1.01 <= val <= 100.0:
+                    odds = val
+                    break
+            except ValueError:
+                continue
+
+        # В качестве selection пока берём весь текст блока
+        selection = text
+
+        if match and odds:
+            tips.append(
+                {
+                    "match": match,
+                    "selection": selection,
+                    "odds": odds,
+                    "author": profile_name
+                }
+            )
+
+    return tips
+    
 def extract_tips_with_gpt(html: str, site_name: str, site_url: str) -> list[dict]:
     """
     Используем OpenAI, чтобы вытащить структурированный список актуальных прогнозов с профиля bettingexpert.
@@ -261,14 +350,17 @@ def check_sites_once():
             parsed_profile = parse_bettingexpert_profile(new_html, name, url)
             print(f"[INFO] Профиль: {parsed_profile.get('profile_name')} — Tips: {parsed_profile.get('tips_count')}")
             
-        # Пробуем вытащить прогнозы через GPT (пока только логируем)
+        # HTML-парсер ставок для профилей bettingexpert (пока только логируем)
         extracted_tips = []
         if site.get("source") == "bettingexpert":
-            extracted_tips = extract_tips_with_gpt(new_html, name, url)
-            print(f"[INFO] Найдено прогнозов через GPT: {len(extracted_tips)}")
+            extracted_tips = parse_bettingexpert_tips(new_html, name)
+            print(f"[INFO] HTML-парсер: найдено прогнозов: {len(extracted_tips)}")
             # Покажем максимум 2 в логах
             for tip in extracted_tips[:2]:
-                print(f"[INFO] Прогноз: матч={tip.get('match')}, выбор={tip.get('selection')}, кэф={tip.get('odds')}, автор={tip.get('author')}")
+                print(
+                    f"[INFO] HTML-прогноз: матч={tip.get('match')}, выбор={tip.get('selection')}, "
+                    f"кэф={tip.get('odds')}, автор={tip.get('author')}"
+                )
 
         new_hash = calc_hash(new_html)
         old_entry = state.get(key)
