@@ -431,17 +431,144 @@ def filter_tips_next_hour(tips: list[dict]) -> list[dict]:
             result.append(tip)
 
     return result
+    
+def update_upcoming_matches(state: dict, tips: list[dict]):
+    """
+    Обновляет в state["upcoming_matches"] информацию о будущих матчах по новым прогнозам.
+    Сохраняем матчи, до которых от сейчас до 24 часов вперёд.
+    """
+    upcoming = state.setdefault("upcoming_matches", {})
+
+    now = datetime.now(timezone.utc)
+    max_ahead = timedelta(hours=24)
+
+    for tip in tips:
+        match = tip.get("match")
+        market = tip.get("market")
+        selection = tip.get("selection")
+        author = tip.get("author")
+        kickoff = tip.get("kickoff_time_utc")
+        odds = tip.get("odds")
+
+        if not match or not market or not selection or not author or not kickoff:
+            continue
+
+        try:
+            kickoff_dt = datetime.fromisoformat(kickoff)
+        except Exception:
+            continue
+
+        delta = kickoff_dt - now
+        if not (timedelta(0) <= delta <= max_ahead):
+            # если матч слишком далеко или уже прошёл — не держим
+            continue
+
+        key = f"{match}|||{market}|||{selection}"
+
+        if key not in upcoming:
+            upcoming[key] = {
+                "match": match,
+                "market": market,
+                "selection": selection,
+                "kickoff": kickoff,
+                "authors": [],
+                "odds_list": [],
+                "notified": False
+            }
+
+        if author not in upcoming[key]["authors"]:
+            upcoming[key]["authors"].append(author)
+        if isinstance(odds, (int, float)):
+            upcoming[key]["odds_list"].append(odds)
+
+
+def process_upcoming_matches(state: dict):
+    """
+    Проверяет сохранённые будущие матчи и отправляет уведомления,
+    если до матча сейчас 0–80 минут и есть минимум два разных типстера.
+    """
+    upcoming = state.get("upcoming_matches") or {}
+    if not upcoming:
+        return
+
+    now = datetime.now(timezone.utc)
+    max_before = timedelta(minutes=80)
+
+    parts = []
+
+    for key, info in list(upcoming.items()):
+        if info.get("notified"):
+            continue
+
+        match = info.get("match") or "матч неизвестен"
+        market = info.get("market") or "маркет не указан"
+        selection = info.get("selection") or "выбор не указан"
+        kickoff_str = info.get("kickoff")
+        authors = info.get("authors") or []
+        odds_list = info.get("odds_list") or []
+
+        if not kickoff_str:
+            continue
+
+        try:
+            kickoff = datetime.fromisoformat(kickoff_str)
+        except Exception:
+            continue
+
+        delta = kickoff - now
+        if not (timedelta(0) <= delta <= max_before):
+            # либо ещё рано (>80 мин), либо уже поздно (<0) — ждём или пропускаем
+            continue
+
+        unique_authors = sorted(set(authors))
+        count = len(unique_authors)
+        if count < 2:
+            # меньше двух разных типстеров — не уведомляем
+            continue
+
+        avg_odds = sum(odds_list) / len(odds_list) if odds_list else None
+        odds_str = f"{avg_odds:.2f}" if avg_odds is not None else "—"
+        kickoff_human = kickoff_str
+
+        part = (
+            f"<b>Матч:</b> {match}\n"
+            f"Время (UTC): {kickoff_human}\n"
+            f"Маркет: {market}\n"
+            f"Выбор: {selection}\n"
+            f"Поставили: {count} типстер(ов)\n"
+            f"Имена: {', '.join(unique_authors)}\n"
+            f"Средний кэф: {odds_str}\n"
+            f"{'-'*40}"
+        )
+        parts.append(part)
+
+        info["notified"] = True
+
+    if parts:
+        full_message = "\n\n".join(parts)
+        try:
+            send_telegram_message(full_message)
+            print("[INFO] Уведомление по отложенным матчам отправлено.")
+        except Exception as e:
+            print(f"[ERROR] Не удалось отправить сообщение по отложенным матчам: {e}")
 
 # 4. Основная логика проверки сайтов
 
 def check_sites_once():
     state = load_state()
+
+    # Подполя состояния:
+    # sites_state — состояние по сайтам (как раньше весь state)
+    # upcoming_matches — память о будущих матчах
+    sites_state = state.setdefault("sites_state", {})
+    upcoming_matches = state.setdefault("upcoming_matches", {})
+
     changes_found = []
 
     for site in SITES:
         name = site["name"]
         url = site["url"]
-        key = url  # ключ в state
+        key = url  # ключ в sites_state
 
         print(f"[INFO] Проверяю сайт: {name} ({url})")
 
@@ -470,11 +597,11 @@ def check_sites_once():
                 )
 
         new_hash = calc_hash(new_html)
-        old_entry = state.get(key)
+        old_entry = sites_state.get(key)
 
         if old_entry is None:
             print(f"[INFO] Для {url} ещё нет сохранённой версии. Сохраняю впервые.")
-            state[key] = {
+            sites_state[key] = {
                 "hash": new_hash,
                 "html": new_html,
                 "tips_count": parsed_profile.get("tips_count") if parsed_profile else None
@@ -504,9 +631,36 @@ def check_sites_once():
             try:
                 # 1) берём все прогнозы из GPT
                 raw_tips = extract_tips_with_gpt(new_html, name, url)
-                # 2) оставляем только те, что начнутся в ближайший час
-                gpt_tips = filter_tips_next_hour(raw_tips)
-                print(f"[INFO] GPT-парсер: всего={len(raw_tips)}, в ближайший час={len(gpt_tips)}")
+
+                # 2) обогащаем их временем начала матча (kickoff_time_utc),
+                #    даже если матч ещё далеко
+                enriched_tips = []
+                for tip in raw_tips:
+                    sport = (tip.get("sport") or "").lower()
+                    home_team = tip.get("home_team")
+                    away_team = tip.get("away_team")
+
+                    kickoff = get_kickoff_time_utc_thesportsdb(sport, home_team, away_team)
+                    if not kickoff:
+                        continue
+
+                    tip["kickoff_time_utc"] = kickoff.isoformat()
+                    enriched_tips.append(tip)
+
+                # 3) обновляем "память матчей" по этим прогнозам
+                update_upcoming_matches(state, enriched_tips)
+
+                # 4) из этих же обогащённых tips берём только те, что в ближайшие 80 минут
+                gpt_tips = []
+                now = datetime.now(timezone.utc)
+                max_before = timedelta(minutes=80)
+                for tip in enriched_tips:
+                    kickoff = datetime.fromisoformat(tip["kickoff_time_utc"])
+                    delta = kickoff - now
+                    if timedelta(0) <= delta <= max_before:
+                        gpt_tips.append(tip)
+
+                print(f"[INFO] GPT-парсер: всего={len(raw_tips)}, с известным временем={len(enriched_tips)}, в ближайшие 80 минут={len(gpt_tips)}")
             except Exception as e:
                 print(f"[ERROR] Ошибка GPT-парсера/фильтра для {url}: {e}")
                 gpt_tips = []
@@ -518,7 +672,7 @@ def check_sites_once():
             "tips": gpt_tips
         })
 
-        state[key] = {
+        sites_state[key] = {
             "hash": new_hash,
             "html": new_html,
             "tips_count": parsed_profile.get("tips_count") if parsed_profile else None
@@ -610,6 +764,10 @@ def check_sites_once():
             print(f"[ERROR] Не удалось отправить сообщение в Telegram: {e}")
     else:
         print("[INFO] После группировки подходящих матчей не осталось — уведомление не шлём.")
+
+    # После обработки свежих изменений — проверяем отложенные матчи
+    process_upcoming_matches(state)
+    save_state(state)
 
 # 5. Точка входа
 
