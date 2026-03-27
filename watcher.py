@@ -440,7 +440,7 @@ def update_upcoming_matches(state: dict, tips: list[dict]):
     upcoming = state.setdefault("upcoming_matches", {})
 
     now = datetime.now(timezone.utc)
-    max_ahead = timedelta(hours=24)
+    max_ahead = timedelta(days=7)
 
     for tip in tips:
         match = tip.get("match")
