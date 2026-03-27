@@ -411,7 +411,7 @@ def filter_tips_next_hour(tips: list[dict]) -> list[dict]:
     Оставляет только те прогнозы (football/basketball), у которых матч начнётся в ближайший час.
     """
     now = datetime.now(timezone.utc)
-    one_hour = timedelta(hours=1)
+    max_before = timedelta(minutes=80)
     result = []
 
     for tip in tips:
@@ -424,7 +424,7 @@ def filter_tips_next_hour(tips: list[dict]) -> list[dict]:
             continue
 
         delta = kickoff - now
-        if timedelta(0) <= delta <= one_hour:
+        if timedelta(0) <= delta <= max_before:
             tip["kickoff_time_utc"] = kickoff.isoformat()
             result.append(tip)
 
@@ -524,54 +524,90 @@ def check_sites_once():
 
     save_state(state)
 
-    if changes_found:
-        parts = []
-        for ch in changes_found:
-            tips = ch.get("tips") or []
-            if not tips:
-                # для этого сайта нет матчей в ближайший час — пропускаем
-                continue
+    # 1) Собираем все tips в один список
+    all_tips_next_hour = []
 
-            base_part = (
-                f"<b>Прогнозы в ближайший час:</b> {ch['name']}\n"
-                f"URL: {ch['url']}\n\n"
-            )
+    for ch in changes_found:
+        tips = ch.get("tips") or []
+        for tip in tips:
+            all_tips_next_hour.append(tip)
 
-            lines = []
-            for tip in tips:
-                match = tip.get("match") or "матч неизвестен"
-                market = tip.get("market") or "маркет не указан"
-                selection = tip.get("selection") or "выбор не указан"
-                odds = tip.get("odds")
-                kickoff = tip.get("kickoff_time_utc")
-                author = tip.get("author") or ch["name"]
+    if not all_tips_next_hour:
+        print("[INFO] Изменения есть, но матчей в ближайший час нет — уведомление не шлём.")
+        return
 
-                odds_str = f"{odds:.2f}" if isinstance(odds, (int, float)) else "—"
-                kickoff_str = kickoff or "время неизвестно"
+    # 2) Группируем по (match, market, selection)
+    groups = {}
 
-                lines.append(
-                    f"• {match}\n"
-                    f"  Время (UTC): {kickoff_str}\n"
-                    f"  Маркет: {market}\n"
-                    f"  Выбор: {selection}\n"
-                    f"  Кэф: {odds_str}\n"
-                    f"  Автор: {author}\n"
-                )
+    for tip in all_tips_next_hour:
+        match = tip.get("match") or "матч неизвестен"
+        market = tip.get("market") or "маркет не указан"
+        selection = tip.get("selection") or "выбор не указан"
+        kickoff = tip.get("kickoff_time_utc")
+        author = tip.get("author") or "неизвестный автор"
+        odds = tip.get("odds")
 
-            part = base_part + "\n".join(lines) + f"\n{'-'*40}"
-            parts.append(part)
+        key = (match, market, selection)
 
-        if parts:
-            full_message = "\n\n".join(parts)
-            try:
-                send_telegram_message(full_message)
-                print("[INFO] Уведомление в Telegram отправлено (есть матчи в ближайший час).")
-            except Exception as e:
-                print(f"[ERROR] Не удалось отправить сообщение в Telegram: {e}")
-        else:
-            print("[INFO] Изменения есть, но матчей в ближайший час нет — уведомление не шлём.")
+        if key not in groups:
+            groups[key] = {
+                "match": match,
+                "market": market,
+                "selection": selection,
+                "kickoff": kickoff,
+                "authors": [],
+                "odds_list": []
+            }
+
+        groups[key]["authors"].append(author)
+        if isinstance(odds, (int, float)):
+            groups[key]["odds_list"].append(odds)
+
+        # если в группе ещё не было kickoff, а тут есть — запомним
+        if not groups[key]["kickoff"] and kickoff:
+            groups[key]["kickoff"] = kickoff
+
+    # 3) Формируем текст для Telegram по группам
+    parts = []
+
+    for (match, market, selection), g in groups.items():
+        authors = g["authors"]
+        unique_authors = sorted(set(authors))
+        count = len(unique_authors)
+
+        # ВАЖНО: если меньше двух разных типстеров — пропускаем этот матч
+        if count < 2:
+            continue
+
+        odds_list = g["odds_list"]
+        kickoff = g["kickoff"]
+
+        avg_odds = sum(odds_list) / len(odds_list) if odds_list else None
+        odds_str = f"{avg_odds:.2f}" if avg_odds is not None else "—"
+        kickoff_str = kickoff or "время неизвестно"
+
+        part = (
+            f"<b>Матч:</b> {match}\n"
+            f"Время (UTC): {kickoff_str}\n"
+            f"Маркет: {market}\n"
+            f"Выбор: {selection}\n"
+            f"Поставили: {count} типстер(ов)\n"
+            f"Имена: {', '.join(unique_authors)}\n"
+            f"Средний кэф: {odds_str}\n"
+            f"{'-'*40}"
+        )
+        parts.append(part)
+
+
+    if parts:
+        full_message = "\n\n".join(parts)
+        try:
+            send_telegram_message(full_message)
+            print("[INFO] Уведомление в Telegram отправлено (сгруппированные матчи).")
+        except Exception as e:
+            print(f"[ERROR] Не удалось отправить сообщение в Telegram: {e}")
     else:
-        print("[INFO] Изменений ни на одном сайте не найдено.")
+        print("[INFO] После группировки подходящих матчей не осталось — уведомление не шлём.")
 
 # 5. Точка входа
 
