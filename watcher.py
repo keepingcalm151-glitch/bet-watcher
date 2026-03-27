@@ -6,6 +6,8 @@ import hashlib
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+import time
 
 CONFIG_PATH = "config.json"
 STATE_PATH = "state.json"
@@ -612,4 +614,22 @@ def check_sites_once():
 # 5. Точка входа
 
 if __name__ == "__main__":
-    check_sites_once()
+    CHECK_INTERVAL_MINUTES = 59  # можно потом взять из config["check_interval_minutes"]
+
+    while True:
+        # Берём текущее время в Москве
+        now_moscow = datetime.now(ZoneInfo("Europe/Moscow"))
+        hour = now_moscow.hour
+
+        # Если время с 00:00 до 06:59 по Москве — спим до следующего цикла, ничего не проверяем
+        if 0 <= hour < 7:
+            print(f"[INFO] Сейчас {now_moscow.strftime('%Y-%m-%d %H:%M')} по Москве. Ночной режим, проверки не выполняем.")
+        else:
+            print(f"[INFO] Запуск проверки сайтов (московское время: {now_moscow.strftime('%Y-%m-%d %H:%M')})...")
+            try:
+                check_sites_once()
+            except Exception as e:
+                print(f"[ERROR] Критическая ошибка в check_sites_once: {e}")
+
+        print(f"[INFO] Сон {CHECK_INTERVAL_MINUTES} минут до следующей проверки...")
+        time.sleep(CHECK_INTERVAL_MINUTES * 60)
