@@ -5,6 +5,7 @@ import os
 import hashlib
 import requests
 from bs4 import BeautifulSoup
+from datetime import datetime, timedelta, timezone
 
 CONFIG_PATH = "config.json"
 STATE_PATH = "state.json"
@@ -22,6 +23,7 @@ OPENAI_API_KEY = config["openai_api_key"]
 TELEGRAM_BOT_TOKEN = config["telegram_bot_token"]
 TELEGRAM_CHAT_ID = config["telegram_chat_id"]
 SITES = config["sites"]
+THESPORTSDB_KEY = config.get("thesportsdb_key")
 
 # 2. Работа с локальным состоянием (state.json)
 
@@ -264,16 +266,26 @@ def extract_tips_with_gpt(html: str, site_name: str, site_url: str) -> list[dict
     api_url = "https://api.openai.com/v1/chat/completions"
 
     system_prompt = (
-        "Ты парсер ставок с сайта bettingexpert. "
-        "Тебе дают HTML страницы профиля типстера. "
-        "Твоя задача — вытащить ТОЛЬКО актуальные опубликованные прогнозы (tips) этого автора. "
-        "Для каждого прогноза верни структурированные поля: "
-        "match (строка, название матча), "
-        "market (типа '1X2', 'Asian handicap', 'Total points', и т.п.), "
-        "selection (строка, как написано на сайте — например, 'Macarthur FC +0.50 (AH)' или 'Cambridge U to win Draw No Bet'), "
-        "odds (десятичный коэффициент, число), "
-        "author (имя автора профиля). "
-        "Игнорируй общие статистики, About me и т.п. Нас интересуют только конкретные ставки."
+    "You are a betting tip parser for bettingexpert profiles. "
+    "You receive the HTML of a tipster profile page. "
+    "Your goal is to extract ONLY currently active tips of this author.\n\n"
+    "For EACH tip, return a JSON object with EXACTLY these fields:\n"
+    "{\n"
+    '  "match": "Boston Celtics vs Atlanta Hawks",\n'
+    '  "home_team": "Boston Celtics",\n'
+    '  "away_team": "Atlanta Hawks",\n'
+    '  "league": "NBA",\n'
+    '  "sport": "basketball",\n'
+    '  "market": "Asian handicap",\n'
+    '  "selection": "Atlanta Hawks +8.50 (AH)",\n'
+    '  "odds": 1.90,\n'
+    '  "author": "Dyole"\n'
+    "}\n\n"
+    "Return a JSON ARRAY of such objects.\n"
+    "- sport MUST be in English: 'football' or 'basketball' when possible.\n"
+    "- If some field is unknown, set it to null.\n"
+    "- Do NOT include any other fields.\n"
+    "- Output ONLY the JSON array, no explanations or text around it."
     )
 
     user_prompt = (
@@ -324,6 +336,99 @@ def extract_tips_with_gpt(html: str, site_name: str, site_url: str) -> list[dict
     except Exception:
         print("[ERROR] Не удалось корректно разобрать JSON с прогнозами от OpenAI.")
         return []
+        
+def get_kickoff_time_utc_thesportsdb(sport: str, home_team: str, away_team: str) -> datetime | None:
+    """
+    По виду спорта (football/basketball) и двум командам пытается найти ближайший матч
+    через TheSportsDB и вернуть время начала в UTC. Если не нашли — None.
+    """
+    if not THESPORTSDB_KEY or not home_team or not away_team:
+        return None
+
+    sport = (sport or "").lower()
+    base_url = "https://www.thesportsdb.com/api/v1/json"
+
+    if sport not in ["football", "basketball"]:
+        return None
+
+    # 1) ищем id команды по имени (home_team)
+    search_team_url = f"{base_url}/{THESPORTSDB_KEY}/searchteams.php"
+    try:
+        resp = requests.get(search_team_url, params={"t": home_team}, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        print(f"[ERROR] TheSportsDB search error ({sport}): {e}")
+        return None
+
+    teams = data.get("teams") or []
+    if not teams:
+        return None
+
+    team_id = teams[0].get("idTeam")
+    if not team_id:
+        return None
+
+    # 2) берём ближайшие события этой команды
+    events_url = f"{base_url}/{THESPORTSDB_KEY}/eventsnext.php"
+    try:
+        resp = requests.get(events_url, params={"id": team_id}, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        print(f"[ERROR] TheSportsDB events error ({sport}): {e}")
+        return None
+
+    events = data.get("events") or []
+    if not events:
+        return None
+
+    best_time = None
+    away_lower = (away_team or "").lower()
+
+    for ev in events:
+        home = (ev.get("strHomeTeam") or "").lower()
+        away = (ev.get("strAwayTeam") or "").lower()
+
+        if home_team.lower() in home and away_lower in away:
+            date_str = ev.get("dateEvent")  # "2026-03-27"
+            time_str = ev.get("strTime")    # "20:45:00"
+            if not date_str or not time_str:
+                continue
+
+            try:
+                dt = datetime.fromisoformat(f"{date_str}T{time_str}").replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+
+            if best_time is None or dt < best_time:
+                best_time = dt
+
+    return best_time
+    
+def filter_tips_next_hour(tips: list[dict]) -> list[dict]:
+    """
+    Оставляет только те прогнозы (football/basketball), у которых матч начнётся в ближайший час.
+    """
+    now = datetime.now(timezone.utc)
+    one_hour = timedelta(hours=1)
+    result = []
+
+    for tip in tips:
+        sport = (tip.get("sport") or "").lower()
+        home_team = tip.get("home_team")
+        away_team = tip.get("away_team")
+
+        kickoff = get_kickoff_time_utc_thesportsdb(sport, home_team, away_team)
+        if not kickoff:
+            continue
+
+        delta = kickoff - now
+        if timedelta(0) <= delta <= one_hour:
+            tip["kickoff_time_utc"] = kickoff.isoformat()
+            result.append(tip)
+
+    return result
 
 # 4. Основная логика проверки сайтов
 
@@ -389,10 +494,26 @@ def check_sites_once():
             print(f"[ERROR] Ошибка при обращении к OpenAI для {url}: {e}")
             diff_text = "Ошибка при запросе к OpenAI."
 
+        # По умолчанию — без GPT-tips
+        gpt_tips = []
+
+        # Если это профиль bettingexpert — пробуем вытащить прогнозы через GPT
+        if site.get("source") == "bettingexpert":
+            try:
+                # 1) берём все прогнозы из GPT
+                raw_tips = extract_tips_with_gpt(new_html, name, url)
+                # 2) оставляем только те, что начнутся в ближайший час
+                gpt_tips = filter_tips_next_hour(raw_tips)
+                print(f"[INFO] GPT-парсер: всего={len(raw_tips)}, в ближайший час={len(gpt_tips)}")
+            except Exception as e:
+                print(f"[ERROR] Ошибка GPT-парсера/фильтра для {url}: {e}")
+                gpt_tips = []
+
         changes_found.append({
             "name": name,
             "url": url,
-            "diff": diff_text
+            "diff": diff_text,
+            "tips": gpt_tips
         })
 
         state[key] = {
@@ -406,21 +527,49 @@ def check_sites_once():
     if changes_found:
         parts = []
         for ch in changes_found:
-            part = (
-                f"<b>Изменения на сайте:</b> {ch['name']}\n"
+            tips = ch.get("tips") or []
+            if not tips:
+                # для этого сайта нет матчей в ближайший час — пропускаем
+                continue
+
+            base_part = (
+                f"<b>Прогнозы в ближайший час:</b> {ch['name']}\n"
                 f"URL: {ch['url']}\n\n"
-                f"{ch['diff']}\n"
-                f"{'-'*40}"
             )
+
+            lines = []
+            for tip in tips:
+                match = tip.get("match") or "матч неизвестен"
+                market = tip.get("market") or "маркет не указан"
+                selection = tip.get("selection") or "выбор не указан"
+                odds = tip.get("odds")
+                kickoff = tip.get("kickoff_time_utc")
+                author = tip.get("author") or ch["name"]
+
+                odds_str = f"{odds:.2f}" if isinstance(odds, (int, float)) else "—"
+                kickoff_str = kickoff or "время неизвестно"
+
+                lines.append(
+                    f"• {match}\n"
+                    f"  Время (UTC): {kickoff_str}\n"
+                    f"  Маркет: {market}\n"
+                    f"  Выбор: {selection}\n"
+                    f"  Кэф: {odds_str}\n"
+                    f"  Автор: {author}\n"
+                )
+
+            part = base_part + "\n".join(lines) + f"\n{'-'*40}"
             parts.append(part)
 
-        full_message = "\n\n".join(parts)
-
-        try:
-            send_telegram_message(full_message)
-            print("[INFO] Уведомление в Telegram отправлено.")
-        except Exception as e:
-            print(f"[ERROR] Не удалось отправить сообщение в Telegram: {e}")
+        if parts:
+            full_message = "\n\n".join(parts)
+            try:
+                send_telegram_message(full_message)
+                print("[INFO] Уведомление в Telegram отправлено (есть матчи в ближайший час).")
+            except Exception as e:
+                print(f"[ERROR] Не удалось отправить сообщение в Telegram: {e}")
+        else:
+            print("[INFO] Изменения есть, но матчей в ближайший час нет — уведомление не шлём.")
     else:
         print("[INFO] Изменений ни на одном сайте не найдено.")
 
