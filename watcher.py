@@ -538,19 +538,16 @@ def update_upcoming_matches(state: dict, tips: list[dict]):
 
 def process_upcoming_matches(state: dict):
     """
-    Проверяет сохранённые будущие матчи и отправляет уведомления,
-    если до матча сейчас -40–80 минут и есть минимум два разных типстера.
-    Отрицательное значение означает, что матч уже идёт, но не дольше 40 минут.
+    Проверяет сохранённые матчи и отправляет уведомления,
+    если матч начинается/начался в окне ±2.5 часа от текущего времени
+    и есть минимум два разных типстера.
     """
     upcoming = state.get("upcoming_matches") or {}
     if not upcoming:
         return
 
-    # Локальное "сейчас" — в той же зоне, в которой мы воспринимаем время на сайте.
-    # Проще всего — Москва, если ты хочешь ориентироваться на московские часы.
     now = datetime.now(MOSCOW_TZ)
-    max_before = timedelta(minutes=80)
-    max_after = timedelta(minutes=40)
+    window = timedelta(hours=2, minutes=30)
 
     parts = []
 
@@ -580,9 +577,8 @@ def process_upcoming_matches(state: dict):
             kickoff = kickoff_local.astimezone(MOSCOW_TZ)
 
         delta = kickoff - now
-        # допускаем, что матч уже идёт до 40 минут
-        if not (-max_after <= delta <= max_before):
-            # слишком рано (>80 мин до начала) или уже давно идёт/закончился (<-40)
+        # окно от -2.5 до +2.5 часов
+        if not (-window <= delta <= window):
             continue
 
         unique_authors = sorted(set(authors))
@@ -707,8 +703,8 @@ def check_sites_once():
 
                 # 2) обогащаем временем начала матча (UTC) с каждой страницы tip'а
                 enriched_tips = []
-                now = datetime.now(timezone.utc)
-                max_before = timedelta(minutes=80)
+                now = datetime.now(MOSCOW_TZ)
+                window = timedelta(hours=2, minutes=30)
 
                 for tip in html_tips:
                     tip_url = tip.get("tip_url")
@@ -719,18 +715,28 @@ def check_sites_once():
                     if not kickoff:
                         continue
 
+                    # сохраняем локальное время матча (без tz или в МСК)
                     tip["kickoff_time_utc"] = kickoff.isoformat()
                     enriched_tips.append(tip)
 
                 # 3) обновляем память матчей (до 7 дней вперед)
                 update_upcoming_matches(state, enriched_tips)
 
-                # 4) фильтруем только те, что начинаются в ближайшие 80 минут
+                # 4) фильтруем только те, что в окне ±2.5 часа
                 gpt_tips = []
                 for tip in enriched_tips:
-                    kickoff = datetime.fromisoformat(tip["kickoff_time_utc"])
-                    delta = kickoff - now
-                    if timedelta(0) <= delta <= max_before:
+                    try:
+                        kickoff_local = datetime.fromisoformat(tip["kickoff_time_utc"])
+                    except Exception:
+                        continue
+
+                    if kickoff_local.tzinfo is None:
+                        kickoff_dt = kickoff_local.replace(tzinfo=MOSCOW_TZ)
+                    else:
+                        kickoff_dt = kickoff_local.astimezone(MOSCOW_TZ)
+
+                    delta = kickoff_dt - now
+                    if -window <= delta <= window:
                         gpt_tips.append(tip)
 
                 print(
