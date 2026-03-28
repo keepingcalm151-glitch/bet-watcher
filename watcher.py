@@ -417,7 +417,23 @@ def parse_kickoff_from_tip_html(html: str) -> datetime | None:
             pass
 
     return dt_local
-        
+
+def get_kickoff_time_from_bettingexpert_tip(tip_url: str) -> datetime | None:
+    """
+    Скачивает страницу tip'а на bettingexpert и вытаскивает время матча
+    через parse_kickoff_from_tip_html. Возвращает naive datetime (локальное время).
+    """
+    try:
+        html = fetch_page(tip_url)
+    except Exception as e:
+        print(f"[ERROR] Не удалось скачать страницу tip'а {tip_url}: {e}")
+        return None
+
+    dt = parse_kickoff_from_tip_html(html)
+    if not dt:
+        print(f"[WARN] Не удалось распарсить время матча с {tip_url}")
+    return dt
+
 def get_kickoff_time_utc_thesportsdb(sport: str, home_team: str, away_team: str) -> datetime | None:
     """
     По виду спорта (football/basketball) и двум командам пытается найти ближайший матч
@@ -765,9 +781,9 @@ def check_sites_once():
         for tip in tips:
             all_tips_next_hour.append(tip)
 
-if not all_tips_next_hour:
-    print("[INFO] Изменения есть, но матчей в окне ±2.5 часа нет — уведомление не шлём.")
-    return
+    if not all_tips_next_hour:
+        print("[INFO] Изменения есть, но матчей в окне ±2.5 часа нет — уведомление не шлём.")
+        return
 
     # 2) Группируем по (match, market, selection)
     groups = {}
