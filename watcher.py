@@ -701,9 +701,9 @@ def check_sites_once():
                 # 1) список прогнозов с профиля
                 html_tips = parse_bettingexpert_tips(new_html, name, url)
 
-                # 2) обогащаем временем начала матча (UTC) с каждой страницы tip'а
+                # 2) обогащаем временем начала матча (локальное время) с каждой страницы tip'а
                 enriched_tips = []
-                now = datetime.now(MOSCOW_TZ)
+                now = datetime.now()  # локальное время машины (для Railway это UTC, но kickoff мы трактуем так же)
                 window = timedelta(hours=2, minutes=30)
 
                 for tip in html_tips:
@@ -715,14 +715,14 @@ def check_sites_once():
                     if not kickoff:
                         continue
 
-                    # сохраняем локальное время матча (без tz или в МСК)
+                    # сохраняем время матча как есть (naive datetime -> ISO)
                     tip["kickoff_time_utc"] = kickoff.isoformat()
                     enriched_tips.append(tip)
 
                 # 3) обновляем память матчей (до 7 дней вперед)
                 update_upcoming_matches(state, enriched_tips)
 
-                # 4) фильтруем только те, что в окне ±2.5 часа
+                # 4) выбираем только те матчи, которые в окне ±2.5 часа от now
                 gpt_tips = []
                 for tip in enriched_tips:
                     try:
@@ -730,18 +730,13 @@ def check_sites_once():
                     except Exception:
                         continue
 
-                    if kickoff_local.tzinfo is None:
-                        kickoff_dt = kickoff_local.replace(tzinfo=MOSCOW_TZ)
-                    else:
-                        kickoff_dt = kickoff_local.astimezone(MOSCOW_TZ)
-
-                    delta = kickoff_dt - now
+                    delta = kickoff_local - now
                     if -window <= delta <= window:
                         gpt_tips.append(tip)
 
                 print(
                     f"[INFO] bettingexpert-HTML: всего={len(html_tips)}, "
-                    f"с известным временем={len(enriched_tips)}, в ближайшие 80 минут={len(gpt_tips)}"
+                    f"с известным временем={len(enriched_tips)}, в окне ±2.5 часа={len(gpt_tips)}"
                 )
             except Exception as e:
                 print(f"[ERROR] Ошибка HTML-парсера/фильтра для {url}: {e}")
@@ -770,9 +765,9 @@ def check_sites_once():
         for tip in tips:
             all_tips_next_hour.append(tip)
 
-    if not all_tips_next_hour:
-        print("[INFO] Изменения есть, но матчей в ближайший час нет — уведомление не шлём.")
-        return
+if not all_tips_next_hour:
+    print("[INFO] Изменения есть, но матчей в окне ±2.5 часа нет — уведомление не шлём.")
+    return
 
     # 2) Группируем по (match, market, selection)
     groups = {}
