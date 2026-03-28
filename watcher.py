@@ -99,6 +99,79 @@ def send_telegram_message(text: str):
     }
     resp = requests.post(url, json=payload, timeout=30)
     resp.raise_for_status()
+    
+def short_selection(selection: str, match: str | None = None) -> str:
+    """
+    Делает короткую запись ставки из длинного текста selection.
+    Умеет:
+    - "Over 167.5 points" -> "ТБ 167.5"
+    - "Under 16.5 games" -> "ТМ 16.5"
+    - "<Team> to win  Draw No Bet" -> "ДНБ <Team>"
+    - "<Team> to win" (если известно, это первая/вторая команда) -> "П1" / "П2"
+    - "<Team> -1.00 (AH)" -> "Ф1(-1.0)" / "Ф2(-1.0)" (если команда = хозяева/гости)
+    - " +0.50 (AH)" без команды -> "AH +0.50"
+    Если не распознали — возвращаем исходный selection.
+    """
+    if not selection:
+        return ""
+
+    text = selection.strip()
+
+    # Попробуем вытащить имена команд из match, если есть
+    home_team = away_team = None
+    if match and " vs " in match:
+        home_team, away_team = [p.strip() for p in match.split(" vs ", 1)]
+
+    # Over / Under тотал
+    m_over = re.search(r"\bOver\s+(\d+(\.\d+)?)", text, re.IGNORECASE)
+    if m_over:
+        val = m_over.group(1).replace(",", ".")
+        return f"ТБ {val}"
+
+    m_under = re.search(r"\bUnder\s+(\d+(\.\d+)?)", text, re.IGNORECASE)
+    if m_under:
+        val = m_under.group(1).replace(",", ".")
+        return f"ТМ {val}"
+
+    # Draw No Bet: берем команду до "to win" или до "Draw No Bet"
+    if re.search(r"Draw\s+No\s+Bet", text, re.IGNORECASE):
+        m_team = re.match(r"(.+?)\s+to\s+win", text, re.IGNORECASE)
+        team = m_team.group(1).strip() if m_team else text.split("Draw")[0].strip()
+        return f"ДНБ {team}"
+
+    # Победа команды: "<Team> to win"
+    m_win = re.match(r"(.+?)\s+to\s+win\b", text, re.IGNORECASE)
+    if m_win:
+        team = m_win.group(1).strip()
+        # Пытаемся понять, П1 или П2
+        if home_team and team.lower() in home_team.lower():
+            return "П1"
+        if away_team and team.lower() in away_team.lower():
+            return "П2"
+        # если не поняли, просто вернем "Победа <team>"
+        return f"Победа {team}"
+
+    # Азиатский гандикап: "<Team> +0.50 (AH)" или просто "+0.50 (AH)"
+    m_ah_full = re.match(r"(.+?)\s+([+-]?\d+(\.\d+)?)\s*\(AH\)", text, re.IGNORECASE)
+    if m_ah_full:
+        team = m_ah_full.group(1).strip()
+        val = m_ah_full.group(2).replace(",", ".")
+        # Определяем Ф1/Ф2 по команде
+        if home_team and team.lower() in home_team.lower():
+            return f"Ф1({val})"
+        if away_team and team.lower() in away_team.lower():
+            return f"Ф2({val})"
+        # если не угадали, просто AH с числом
+        return f"AH {val}"
+
+    # Вариант без команды: "+0.50 (AH)"
+    m_ah = re.search(r"([+-]?\d+(\.\d+)?)\s*\(AH\)", text, re.IGNORECASE)
+    if m_ah:
+        val = m_ah.group(1).replace(",", ".")
+        return f"AH {val}"
+
+    # Если ничего не узнали — вернем оригинал
+    return text
 
 def call_openai_diff(old_html: str, new_html: str, site_name: str, site_url: str) -> str:
     """
@@ -640,13 +713,19 @@ def process_upcoming_matches(state: dict):
         kickoff_dt_moscow = kickoff_dt_utc.astimezone(MOSCOW_TZ)
         kickoff_human = kickoff_dt_moscow.strftime("%Y-%m-%d %H:%M")
 
+        # короткая запись ставки c учетом матча (чтобы попытаться сделать П1/П2, Ф1/Ф2)
+        short_sel = short_selection(selection, match)
+
+        # строки вида "Автор — ставка"
+        authors_lines = []
+        for author in unique_authors:
+            authors_lines.append(f"{author} — {short_sel}")
+        authors_block = "\n".join(authors_lines)
+
         part = (
             f"<b>Матч:</b> {match}\n"
             f"Время (МСК): {kickoff_human}\n"
-            f"Маркет: {market}\n"
-            f"Выбор: {selection}\n"
-            f"Поставили: {count} типстер(ов)\n"
-            f"Имена: {', '.join(unique_authors)}\n"
+            f"{authors_block}\n"
             f"Средний кэф: {odds_str}\n"
             f"{'-'*40}"
         )
@@ -862,19 +941,23 @@ def check_sites_once():
         else:
             kickoff_human = "время неизвестно"
 
+        # короткая запись ставки с учетом матча
+        short_sel = short_selection(selection, match)
+
+        authors_lines = []
+        for author in unique_authors:
+            authors_lines.append(f"{author} — {short_sel}")
+        authors_block = "\n".join(authors_lines)
+
         part = (
             f"<b>Матч:</b> {match}\n"
             f"Время (МСК): {kickoff_human}\n"
-            f"Маркет: {market}\n"
-            f"Выбор: {selection}\n"
-            f"Поставили: {count} типстер(ов)\n"
-            f"Имена: {', '.join(unique_authors)}\n"
+            f"{authors_block}\n"
             f"Средний кэф: {odds_str}\n"
             f"{'-'*40}"
         )
 
         parts.append(part)
-
 
     if parts:
         full_message = "\n\n".join(parts)
