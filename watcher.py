@@ -12,8 +12,6 @@ import re
 
 # Часовые пояса
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
-# Время на bettingexpert в европейском часовом поясе (CET/CEST, с зимним/летним временем)
-BETTINGEXPERT_TZ = ZoneInfo("Europe/Copenhagen")
 
 # Таблица месяцев для парсинга даты "2 Apr 10:35"
 MONTHS_EN = {
@@ -371,8 +369,8 @@ def parse_bettingexpert_tips(html: str, profile_name: str, profile_url: str) -> 
 def parse_kickoff_from_tip_html(html: str) -> datetime | None:
     """
     Пытается вытащить из HTML страницы tip'а дату и время матча.
-    Время на bettingexpert считаем локальным (BETTINGEXPERT_TZ, на час раньше Москвы),
-    возвращаем datetime в UTC.
+    Возвращает datetime БЕЗ tzinfo (локальное время, как на сайте).
+    НИКУДА не конвертируем, сравнивать будем с таким же локальным now.
     """
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(" ", strip=True)
@@ -381,7 +379,18 @@ def parse_kickoff_from_tip_html(html: str) -> datetime | None:
     pattern = r"\b(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{1,2}):(\d{2})\b"
     match = re.search(pattern, text)
     if not match:
-        return None
+        # fallback: попробуем только время HH:MM "18:00"
+        m_time = re.search(r"\b(\d{1,2}):(\d{2})\b", text)
+        if not m_time:
+            return None
+        hour = int(m_time.group(1))
+        minute = int(m_time.group(2))
+        now = datetime.now()
+        # считаем, что матч сегодня в указанное время
+        try:
+            return datetime(now.year, now.month, now.day, hour, minute)
+        except ValueError:
+            return None
 
     day_str, month_str, hour_str, minute_str = match.groups()
     day = int(day_str)
@@ -392,131 +401,22 @@ def parse_kickoff_from_tip_html(html: str) -> datetime | None:
     hour = int(hour_str)
     minute = int(minute_str)
 
-    now_utc = datetime.now(timezone.utc)
-    year = now_utc.year
+    now = datetime.now()
+    year = now.year
 
     try:
-        # локальное время сайта (UTC+2, на час раньше Москвы)
-        dt_local = datetime(year, month, day, hour, minute, tzinfo=BETTINGEXPERT_TZ)
+        dt_local = datetime(year, month, day, hour, minute)
     except ValueError:
         return None
 
     # если дата сильно в прошлом (больше 7 дней) – пробуем следующий год
-    if dt_local < now_utc - timedelta(days=7):
+    if dt_local < now - timedelta(days=7):
         try:
             dt_local = dt_local.replace(year=year + 1)
         except ValueError:
             pass
 
-    # переводим в UTC
-    dt_utc = dt_local.astimezone(timezone.utc)
-    return dt_utc
-
-
-def get_kickoff_time_from_bettingexpert_tip(tip_url: str) -> datetime | None:
-    """
-    Скачивает страницу конкретного tip'а на bettingexpert и парсит время начала матча.
-    """
-    try:
-        tip_html = fetch_page(tip_url)
-    except Exception as e:
-        print(f"[ERROR] Не удалось скачать страницу tip {tip_url}: {e}")
-        return None
-
-    kickoff = parse_kickoff_from_tip_html(tip_html)
-    if not kickoff:
-        print(f"[WARN] Не удалось распарсить время начала матча из {tip_url}")
-    return kickoff
-
-def extract_tips_with_gpt(html: str, site_name: str, site_url: str) -> list[dict]:
-    """
-    Используем OpenAI, чтобы вытащить структурированный список актуальных прогнозов с профиля bettingexpert.
-
-    Возвращает список словарей вида:
-    [
-      {
-        "match": "Macarthur FC vs Newcastle Jets",
-        "market": "Asian handicap",
-        "selection": "Macarthur FC +0.50",
-        "odds": 1.93,
-        "author": "Dyole"
-      },
-      ...
-    ]
-    """
-    api_url = "https://api.openai.com/v1/chat/completions"
-
-    system_prompt = (
-    "You are a betting tip parser for bettingexpert profiles. "
-    "You receive the HTML of a tipster profile page. "
-    "Your goal is to extract ONLY currently active tips of this author.\n\n"
-    "For EACH tip, return a JSON object with EXACTLY these fields:\n"
-    "{\n"
-    '  "match": "Boston Celtics vs Atlanta Hawks",\n'
-    '  "home_team": "Boston Celtics",\n'
-    '  "away_team": "Atlanta Hawks",\n'
-    '  "league": "NBA",\n'
-    '  "sport": "basketball",\n'
-    '  "market": "Asian handicap",\n'
-    '  "selection": "Atlanta Hawks +8.50 (AH)",\n'
-    '  "odds": 1.90,\n'
-    '  "author": "Dyole"\n'
-    "}\n\n"
-    "Return a JSON ARRAY of such objects.\n"
-    "- sport MUST be in English: 'football' or 'basketball' when possible.\n"
-    "- If some field is unknown, set it to null.\n"
-    "- Do NOT include any other fields.\n"
-    "- Output ONLY the JSON array, no explanations or text around it."
-    )
-
-    user_prompt = (
-        f"Профиль: {site_name}\nURL: {site_url}\n\n"
-        "Вот HTML страницы профиля:\n"
-        "--------------------------\n"
-        f"{html[:15000]}\n\n"
-        "Верни JSON-массив с прогнозами в точном формате:\n"
-        "[\n"
-        "  {\n"
-        "    \"match\": \"...\",\n"
-        "    \"market\": \"...\",\n"
-        "    \"selection\": \"...\",\n"
-        "    \"odds\": 1.93,\n"
-        "    \"author\": \"...\"\n"
-        "  },\n"
-        "  ...\n"
-        "]\n"
-        "Если прогнозов нет, верни пустой массив []. Никакого текста вокруг, только JSON."
-    )
-
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
-    data = {
-        "model": "gpt-4.1-mini",
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ],
-        "temperature": 0.1
-    }
-
-    resp = requests.post(api_url, headers=headers, json=data, timeout=90)
-    resp.raise_for_status()
-    result = resp.json()
-
-    try:
-        content = result["choices"][0]["message"]["content"]
-        # Пытаемся распарсить как JSON
-        tips = json.loads(content)
-        if isinstance(tips, list):
-            return tips
-        else:
-            return []
-    except Exception:
-        print("[ERROR] Не удалось корректно разобрать JSON с прогнозами от OpenAI.")
-        return []
+    return dt_local
         
 def get_kickoff_time_utc_thesportsdb(sport: str, home_team: str, away_team: str) -> datetime | None:
     """
@@ -587,30 +487,6 @@ def get_kickoff_time_utc_thesportsdb(sport: str, home_team: str, away_team: str)
 
     return best_time
     
-def filter_tips_next_hour(tips: list[dict]) -> list[dict]:
-    """
-    Оставляет только те прогнозы (football/basketball), у которых матч начнётся в ближайший час.
-    """
-    now = datetime.now(timezone.utc)
-    max_before = timedelta(minutes=80)
-    result = []
-
-    for tip in tips:
-        sport = (tip.get("sport") or "").lower()
-        home_team = tip.get("home_team")
-        away_team = tip.get("away_team")
-
-        kickoff = get_kickoff_time_utc_thesportsdb(sport, home_team, away_team)
-        if not kickoff:
-            continue
-
-        delta = kickoff - now
-        if timedelta(0) <= delta <= max_before:
-            tip["kickoff_time_utc"] = kickoff.isoformat()
-            result.append(tip)
-
-    return result
-    
 def update_upcoming_matches(state: dict, tips: list[dict]):
     """
     Обновляет в state["upcoming_matches"] информацию о будущих матчах по новым прогнозам.
@@ -618,7 +494,7 @@ def update_upcoming_matches(state: dict, tips: list[dict]):
     """
     upcoming = state.setdefault("upcoming_matches", {})
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now()  # локальное "сейчас", без tz
     max_ahead = timedelta(days=7)
 
     for tip in tips:
@@ -670,7 +546,9 @@ def process_upcoming_matches(state: dict):
     if not upcoming:
         return
 
-    now = datetime.now(timezone.utc)
+    # Локальное "сейчас" — в той же зоне, в которой мы воспринимаем время на сайте.
+    # Проще всего — Москва, если ты хочешь ориентироваться на московские часы.
+    now = datetime.now(MOSCOW_TZ)
     max_before = timedelta(minutes=80)
     max_after = timedelta(minutes=40)
 
@@ -691,14 +569,20 @@ def process_upcoming_matches(state: dict):
             continue
 
         try:
-            kickoff = datetime.fromisoformat(kickoff_str)
+            kickoff_local = datetime.fromisoformat(kickoff_str)
         except Exception:
             continue
 
+        # считаем, что kickoff_local — это московское локальное время
+        if kickoff_local.tzinfo is None:
+            kickoff = kickoff_local.replace(tzinfo=MOSCOW_TZ)
+        else:
+            kickoff = kickoff_local.astimezone(MOSCOW_TZ)
+
         delta = kickoff - now
-        # Теперь допускаем, что матч уже идёт до 40 минут
+        # допускаем, что матч уже идёт до 40 минут
         if not (-max_after <= delta <= max_before):
-            # слишком рано (>80 мин до начала) или уже давно закончился (<-40)
+            # слишком рано (>80 мин до начала) или уже давно идёт/закончился (<-40)
             continue
 
         unique_authors = sorted(set(authors))
@@ -710,10 +594,7 @@ def process_upcoming_matches(state: dict):
         avg_odds = sum(odds_list) / len(odds_list) if odds_list else None
         odds_str = f"{avg_odds:.2f}" if avg_odds is not None else "—"
 
-        # kickoff_str хранится в UTC → переводим в МСК для сообщения
-        kickoff_dt_utc = datetime.fromisoformat(kickoff_str)
-        kickoff_dt_moscow = kickoff_dt_utc.astimezone(MOSCOW_TZ)
-        kickoff_human = kickoff_dt_moscow.strftime("%Y-%m-%d %H:%M")
+        kickoff_human = kickoff.strftime("%Y-%m-%d %H:%M")
 
         # короткая запись ставки c учетом матча (чтобы попытаться сделать П1/П2, Ф1/Ф2)
         short_sel = short_selection(selection, match)
@@ -931,15 +812,24 @@ def check_sites_once():
             continue
 
         odds_list = g["odds_list"]
-        kickoff = g["kickoff"]
+        kickoff_str = g["kickoff"]
 
         avg_odds = sum(odds_list) / len(odds_list) if odds_list else None
         odds_str = f"{avg_odds:.2f}" if avg_odds is not None else "—"
 
-        # kickoff_str хранится в UTC → переводим в МСК для сообщения
-        kickoff_dt_utc = datetime.fromisoformat(kickoff_str)
-        kickoff_dt_moscow = kickoff_dt_utc.astimezone(MOSCOW_TZ)
-        kickoff_human = kickoff_dt_moscow.strftime("%Y-%m-%d %H:%M")
+        if kickoff_str:
+            try:
+                kickoff_local = datetime.fromisoformat(kickoff_str)
+            except Exception:
+                kickoff_human = "время неизвестно"
+            else:
+                if kickoff_local.tzinfo is None:
+                    kickoff_dt = kickoff_local.replace(tzinfo=MOSCOW_TZ)
+                else:
+                    kickoff_dt = kickoff_local.astimezone(MOSCOW_TZ)
+                kickoff_human = kickoff_dt.strftime("%Y-%m-%d %H:%M")
+        else:
+            kickoff_human = "время неизвестно"
 
         # короткая запись ставки
         short_sel = short_selection(selection, match)
@@ -950,16 +840,9 @@ def check_sites_once():
             authors_lines.append(f"{author} — {short_sel}")
         authors_block = "\n".join(authors_lines)
 
-        # Текст в зависимости от того, начался матч или нет
-        if delta >= timedelta(0):
-            status_line = f"Матч ещё не начался, старт в {kickoff_human} (МСК)"
-        else:
-            minutes_passed = int(abs(delta).total_seconds() // 60)
-            status_line = f"Матч уже идёт (~{minutes_passed} мин), но ещё можно успеть"
-
         part = (
             f"<b>Матч:</b> {match}\n"
-            f"{status_line}\n"
+            f"Время (МСК): {kickoff_human}\n"
             f"{authors_block}\n"
             f"Средний кэф: {odds_str}\n"
             f"{'-'*40}"
