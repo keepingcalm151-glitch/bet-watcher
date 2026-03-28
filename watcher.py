@@ -12,8 +12,8 @@ import re
 
 # Часовые пояса
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
-# Время на bettingexpert на 1 час РАНЬШЕ московского (пример: на сайте 10:35 → в МСК 11:35)
-BETTINGEXPERT_TZ = timezone(timedelta(hours=2))
+# Время на bettingexpert в европейском часовом поясе (CET/CEST, с зимним/летним временем)
+BETTINGEXPERT_TZ = ZoneInfo("Europe/Copenhagen")
 
 # Таблица месяцев для парсинга даты "2 Apr 10:35"
 MONTHS_EN = {
@@ -660,11 +660,11 @@ def update_upcoming_matches(state: dict, tips: list[dict]):
         if isinstance(odds, (int, float)):
             upcoming[key]["odds_list"].append(odds)
 
-
 def process_upcoming_matches(state: dict):
     """
     Проверяет сохранённые будущие матчи и отправляет уведомления,
-    если до матча сейчас 0–80 минут и есть минимум два разных типстера.
+    если до матча сейчас -40–80 минут и есть минимум два разных типстера.
+    Отрицательное значение означает, что матч уже идёт, но не дольше 40 минут.
     """
     upcoming = state.get("upcoming_matches") or {}
     if not upcoming:
@@ -672,6 +672,7 @@ def process_upcoming_matches(state: dict):
 
     now = datetime.now(timezone.utc)
     max_before = timedelta(minutes=80)
+    max_after = timedelta(minutes=40)
 
     parts = []
 
@@ -695,8 +696,9 @@ def process_upcoming_matches(state: dict):
             continue
 
         delta = kickoff - now
-        if not (timedelta(0) <= delta <= max_before):
-            # либо ещё рано (>80 мин), либо уже поздно (<0) — ждём или пропускаем
+        # Теперь допускаем, что матч уже идёт до 40 минут
+        if not (-max_after <= delta <= max_before):
+            # слишком рано (>80 мин до начала) или уже давно закончился (<-40)
             continue
 
         unique_authors = sorted(set(authors))
@@ -934,24 +936,30 @@ def check_sites_once():
         avg_odds = sum(odds_list) / len(odds_list) if odds_list else None
         odds_str = f"{avg_odds:.2f}" if avg_odds is not None else "—"
 
-        if kickoff:
-            kickoff_dt_utc = datetime.fromisoformat(kickoff)
-            kickoff_dt_moscow = kickoff_dt_utc.astimezone(MOSCOW_TZ)
-            kickoff_human = kickoff_dt_moscow.strftime("%Y-%m-%d %H:%M")
-        else:
-            kickoff_human = "время неизвестно"
+        # kickoff_str хранится в UTC → переводим в МСК для сообщения
+        kickoff_dt_utc = datetime.fromisoformat(kickoff_str)
+        kickoff_dt_moscow = kickoff_dt_utc.astimezone(MOSCOW_TZ)
+        kickoff_human = kickoff_dt_moscow.strftime("%Y-%m-%d %H:%M")
 
-        # короткая запись ставки с учетом матча
+        # короткая запись ставки
         short_sel = short_selection(selection, match)
 
+        # строки вида "Автор — ставка"
         authors_lines = []
         for author in unique_authors:
             authors_lines.append(f"{author} — {short_sel}")
         authors_block = "\n".join(authors_lines)
 
+        # Текст в зависимости от того, начался матч или нет
+        if delta >= timedelta(0):
+            status_line = f"Матч ещё не начался, старт в {kickoff_human} (МСК)"
+        else:
+            minutes_passed = int(abs(delta).total_seconds() // 60)
+            status_line = f"Матч уже идёт (~{minutes_passed} мин), но ещё можно успеть"
+
         part = (
             f"<b>Матч:</b> {match}\n"
-            f"Время (МСК): {kickoff_human}\n"
+            f"{status_line}\n"
             f"{authors_block}\n"
             f"Средний кэф: {odds_str}\n"
             f"{'-'*40}"
