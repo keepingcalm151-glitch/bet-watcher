@@ -930,6 +930,13 @@ def process_upcoming_matches(state: dict) -> None:
         chance_pure = info.get("win_chance_pure_percent")
         chance_dirty = info.get("win_chance_dirty_percent")
         chance_clean = info.get("win_chance_clean_percent")
+        
+        # Если пока не посчитан ни один из шансов — не шлём уведомление
+        if not any(
+            isinstance(x, (int, float))
+            for x in (chance_pure, chance_dirty, chance_clean)
+        ):
+            continue
 
         if not kickoff_str:
             continue
@@ -992,6 +999,32 @@ def process_upcoming_matches(state: dict) -> None:
         # 3) Чистый подсчёт (полная история + серии)
         if isinstance(chance_clean, (int, float)):
             lines.append(f"Шанс с учётом истории: {chance_clean:.1f}%")
+
+        # Список грязных матчей (подвешенные ставки авторов)
+        dirty_pending = info.get("win_chance_dirty_pending_matches") or []
+        if dirty_pending:
+            lines.append("Грязные матчи (подвешенные ставки авторов):")
+            for dm in dirty_pending:
+                a = dm.get("author") or "автор неизвестен"
+                m_name = dm.get("match") or "матч неизвестен"
+                sel = dm.get("selection") or "ставка не указана"
+                k_str = dm.get("kickoff")
+
+                if k_str:
+                    try:
+                        k_dt_utc = datetime.fromisoformat(k_str)
+                        if k_dt_utc.tzinfo is None:
+                            k_dt_utc = k_dt_utc.replace(tzinfo=timezone.utc)
+                        k_dt_msk = k_dt_utc.astimezone(MOSCOW_TZ)
+                        k_human = k_dt_msk.strftime("%Y-%m-%d %H:%M")
+                    except Exception:
+                        k_human = k_str
+                else:
+                    k_human = "неизвестно"
+
+                lines.append(
+                    f"  • {a}: {m_name} — {sel} (МСК: {k_human})"
+                )
 
         lines.append("-" * 40)
 
