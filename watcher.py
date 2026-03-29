@@ -470,7 +470,10 @@ def compute_win_chance_from_winrate_only(state: dict, authors: list[str]) -> flo
 def compute_win_chance_dirty_authors(state: dict, authors: list[str]) -> tuple[float | None, list[dict]]:
     """
     Вероятность ставки по авторам с неполной историей ("грязные" авторы):
-    есть win rate, но есть подвешенные матчи (author_ready_for_calc == False).
+    теперь считаем грязный win rate по их реальным ставкам:
+      - won = победа,
+      - lost + подвешенные = поражение,
+      - void игнорируется.
 
     Возвращает (chance_percent, pending_matches), где:
       - chance_percent: float или None,
@@ -491,18 +494,19 @@ def compute_win_chance_dirty_authors(state: dict, authors: list[str]) -> tuple[f
         if not stats:
             continue
 
-        # интересуют только грязные
+        # интересуют только грязные авторы (есть подвешенные)
         if author_ready_for_calc(state, author):
             continue
 
-        wr = stats.get("win_rate_percent")
-        if not isinstance(wr, (int, float)):
+        # 1) считаем грязный win rate по всем ставкам автора
+        dirty_wr = compute_dirty_winrate_for_author(state, author)
+        if dirty_wr is None:
             continue
 
-        p = max(0.0, min(1.0, float(wr) / 100.0))
+        p = max(0.0, min(1.0, float(dirty_wr) / 100.0))
         ps.append(p)
 
-        # Добавляем подвешенные матчи этого автора
+        # 2) Добавляем подвешенные матчи этого автора – для вывода в телегу
         for m in get_author_pending_matches(state, author):
             pending_matches.append(
                 {
@@ -776,6 +780,65 @@ def get_author_pending_matches(state: dict, author: str) -> list[dict]:
             )
 
     return pending
+
+def compute_dirty_winrate_for_author(state: dict, author: str) -> float | None:
+    """
+    Считает "грязный" win rate автора:
+      - won считается как победа,
+      - lost и любые другие статусы (кроме void) считаются поражением,
+      - void/returned/refunded/push игнорируются,
+      - ВСЕ подвешенные ставки (kickoff <= сейчас и result is None)
+        считаются проигрышем.
+
+    Возвращает процент (0..100) или None, если нет данных.
+    """
+    bets_by_author = state.get("bets_by_author") or {}
+    author_bets = author_bets = bets_by_author.get(author) or {}
+    if not author_bets:
+        return None
+
+    now_utc = datetime.now(timezone.utc)
+
+    wins = 0
+    total = 0
+
+    for bet in author_bets.values():
+        res = (bet.get("result") or "").lower()
+        kickoff_str = bet.get("kickoff")
+
+        # void и аналоги – пропускаем
+        if res in ("void", "returned", "refunded", "push"):
+            continue
+
+        # Определяем, подвешенная ли ставка (kickoff уже был, но result == None)
+        is_pending_loss = False
+        if not res:  # result пустой или None
+            if kickoff_str:
+                try:
+                    kickoff_dt = datetime.fromisoformat(kickoff_str)
+                    if kickoff_dt.tzinfo is None:
+                        kickoff_dt = kickoff_dt.replace(tzinfo=timezone.utc)
+                except Exception:
+                    kickoff_dt = None
+            else:
+                kickoff_dt = None
+
+            if kickoff_dt is not None and kickoff_dt <= now_utc:
+                # матч уже должен был сыграться, но результат не известен — считаем проигрышем
+                is_pending_loss = True
+
+        # Классифицируем исход
+        if res == "won":
+            wins += 1
+            total += 1
+        elif is_pending_loss or res not in ("", None):
+            # всё, что НЕ won и не void, включая подвешенные, считаем поражением
+            total += 1
+
+    if total == 0:
+        return None
+
+    return (wins / total) * 100.0
 
 def get_author_loss_streak(state: dict, author: str) -> int:
     """
