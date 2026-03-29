@@ -201,6 +201,7 @@ def parse_bettingexpert_tips(html: str, profile_name: str, profile_url: str) -> 
         "odds": 1.93,
         "author": "Dyole",
         "tip_url": "https://www.bettingexpert.com/football/macarthur-fc-vs-newcastle-jets",
+        "result": result,
       },
       ...
     ]
@@ -279,6 +280,27 @@ def parse_bettingexpert_tips(html: str, profile_name: str, profile_url: str) -> 
                         break
                 except ValueError:
                     continue
+                    
+        # Результат ставки (для завершённых ставок, с серым фоном и ярлыком Won/Lost/Void)
+        result = None
+
+        result_badge = block.find(
+            lambda tag: tag.name == "div"
+            and "w-[36px]" in tag.get("class", [])
+            and "font-gc" in tag.get("class", [])
+        )
+        if result_badge:
+            span = result_badge.find("span")
+            if span:
+                text = span.get_text(strip=True).lower()
+                if text == "won":
+                    result = "won"
+                elif text == "lost":
+                    result = "lost"
+                elif text in ("void", "returned", "refunded", "push"):
+                    result = "void"
+                else:
+                    result = text
 
         author = profile_name
 
