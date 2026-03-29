@@ -321,6 +321,41 @@ def parse_bettingexpert_tips(html: str, profile_name: str, profile_url: str) -> 
     return tips
 # ===== 6. Время начала матча: страница tip'а bettingexpert =====
 
+def parse_bettingexpert_author_winrate(html: str) -> float | None:
+    """
+    Парсит процент побед (Win rate) с профиля bettingexpert.
+    Возвращает число в процентах, например 51.37, или None, если не нашёл.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Ищем элемент, где текст ровно "Win rate"
+    label = soup.find(
+        lambda tag: tag.name in ("div", "span")
+        and tag.get_text(strip=True).lower() == "win rate"
+    )
+    if not label or not label.parent:
+        return None
+
+    # Вёрстка такая, что число с процентом — соседний div до подписи
+    prev = label.previous_sibling
+    # пропускаем текстовые узлы и пустяки
+    while prev is not None and getattr(prev, "name", None) is None:
+        prev = prev.previous_sibling
+
+    if not prev:
+        return None
+
+    text = prev.get_text(" ", strip=True)
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s*%", text)
+    if not m:
+        return None
+
+    val = m.group(1).replace(",", ".")
+    try:
+        return float(val)
+    except ValueError:
+        return None
+
 def parse_kickoff_from_tip_html(html: str) -> datetime | None:
     """
     Пытается вытащить из HTML страницы tip'а дату и время матча.
@@ -497,6 +532,32 @@ def update_author_bets(state: dict, tips: list[dict]) -> None:
         }
 # ===== 8. Обработка отложенных матчей и отправка уведомлений =====
 
+def update_author_stats(state: dict, author: str, win_rate: float | None) -> None:
+    """
+    Обновляет state["author_stats"] для конкретного автора.
+
+    Структура:
+      state["author_stats"] = {
+        "Pacopick": {
+          "win_rate_percent": 53.21,
+          "updated_at": "2026-03-29T17:45:00+00:00"
+        },
+        "Dyole": {
+          ...
+        },
+        ...
+      }
+    """
+    stats = state.setdefault("author_stats", {})
+    author_entry = stats.setdefault(author, {})
+
+    # обновляем win rate, только если он распарсился как число
+    if isinstance(win_rate, (int, float)):
+        author_entry["win_rate_percent"] = float(win_rate)
+
+    # фиксируем время обновления (в UTC)
+    author_entry["updated_at"] = datetime.now(timezone.utc).isoformat()
+
 def process_upcoming_matches(state: dict) -> None:
     """
     Проверяет state["upcoming_matches"] и отправляет уведомления,
@@ -621,7 +682,15 @@ def check_profiles_once() -> None:
         except Exception as e:
             print(f"[ERROR] Не удалось скачать {url}: {e}")
             continue
+            
+        try:
+            win_rate = parse_bettingexpert_author_winrate(html)
+        except Exception as e:
+            print(f"[WARN] Не удалось распарсить win rate для {author_name}: {e}")
+            win_rate = None
 
+        update_author_stats(state, author_name, win_rate)
+        
         try:
             tips = parse_bettingexpert_tips(html, author_name, url)
         except Exception as e:
