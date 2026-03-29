@@ -432,13 +432,87 @@ def get_kickoff_time_from_bettingexpert_tip(tip_url: str) -> datetime | None:
     return dt_local.astimezone(timezone.utc)
 # ===== 7. Память по будущим матчам (upcoming_matches) =====
 
+def compute_win_chance_from_winrate_only(state: dict, authors: list[str]) -> float | None:
+    """
+    Вероятность ставки, считая только текущий win rate авторов (как на сайте),
+    без учёта серий и "грязности".
+    """
+    author_stats = state.get("author_stats") or {}
+    ps: list[float] = []
+
+    for author in authors:
+        stats = author_stats.get(author)
+        if not stats:
+            continue
+        wr = stats.get("win_rate_percent")
+        if not isinstance(wr, (int, float)):
+            continue
+
+        p = max(0.0, min(1.0, float(wr) / 100.0))
+        ps.append(p)
+
+    if not ps:
+        return None
+
+    prod_p = 1.0
+    prod_not = 1.0
+    for p in ps:
+        prod_p *= p
+        prod_not *= (1.0 - p)
+
+    denom = prod_p + prod_not
+    if denom <= 0.0:
+        return None
+
+    chance = prod_p / denom
+    return chance * 100.0
+    
+def compute_win_chance_dirty_authors(state: dict, authors: list[str]) -> float | None:
+    """
+    Вероятность ставки по авторам с неполной историей ("грязные" авторы):
+    есть win rate, но есть подвешенные матчи (author_ready_for_calc == False).
+    """
+    author_stats = state.get("author_stats") or {}
+    ps: list[float] = []
+
+    for author in authors:
+        stats = author_stats.get(author)
+        if not stats:
+            continue
+
+        # интересуют только грязные
+        if author_ready_for_calc(state, author):
+            continue
+
+        wr = stats.get("win_rate_percent")
+        if not isinstance(wr, (int, float)):
+            continue
+
+        p = max(0.0, min(1.0, float(wr) / 100.0))
+        ps.append(p)
+
+    if not ps:
+        return None
+
+    prod_p = 1.0
+    prod_not = 1.0
+    for p in ps:
+        prod_p *= p
+        prod_not *= (1.0 - p)
+
+    denom = prod_p + prod_not
+    if denom <= 0.0:
+        return None
+
+    chance = prod_p / denom
+    return chance * 100.0
+    
 def compute_win_chance_for_authors(state: dict, authors: list[str]) -> float | None:
     """
-    Считает шанс выигрыша ставки с учётом:
-      - эффективных вероятностей авторов (win rate + серия неудач),
-      - комбинирования авторов по формуле:
-
-          P = (∏ p_i) / (∏ p_i + ∏ (1 - p_i))
+    Чистый шанс выигрыша ставки:
+      - только по авторам с полной историей (author_ready_for_calc == True),
+      - с учётом серий неудач и формулы 95%,
+      - комбинирование по формуле P = (∏ p_i) / (∏ p_i + ∏ (1 - p_i)).
 
     Возвращает шанс в процентах (0..100) или None.
     """
@@ -447,7 +521,6 @@ def compute_win_chance_for_authors(state: dict, authors: list[str]) -> float | N
     for author in authors:
         p_eff = compute_effective_author_prob(state, author)
         if isinstance(p_eff, (int, float)):
-            # зажимаем 0..1
             p_eff = max(0.0, min(1.0, float(p_eff)))
             ps.append(p_eff)
 
@@ -464,8 +537,8 @@ def compute_win_chance_for_authors(state: dict, authors: list[str]) -> float | N
     if denom <= 0.0:
         return None
 
-    chance = prod_p / denom  # 0..1
-    return chance * 100.0    # в процентах
+    chance = prod_p / denom
+    return chance * 100.0
 
 def update_upcoming_matches(state: dict, tips: list[dict]) -> None:
     """
@@ -520,10 +593,22 @@ def update_upcoming_matches(state: dict, tips: list[dict]) -> None:
         if isinstance(odds, (int, float)):
             upcoming[key]["odds_list"].append(odds)
 
-        # Считаем шанс выигрыша по win rate авторов (если есть данные)
-        chance = compute_win_chance_for_authors(state, upcoming[key]["authors"])
-        if isinstance(chance, (int, float)):
-            upcoming[key]["win_chance_percent"] = chance
+        authors_list = upcoming[key]["authors"]
+
+        # 1) Чистый winrate (не учитывает серии и "грязность")
+        chance_pure = compute_win_chance_from_winrate_only(state, authors_list)
+        if isinstance(chance_pure, (int, float)):
+            upcoming[key]["win_chance_pure_percent"] = chance_pure
+
+        # 2) Только по грязным авторам
+        chance_dirty = compute_win_chance_dirty_authors(state, authors_list)
+        if isinstance(chance_dirty, (int, float)):
+            upcoming[key]["win_chance_dirty_percent"] = chance_dirty
+
+        # 3) Чистый подсчёт (только по авторам с полной историей, с сериями)
+        chance_clean = compute_win_chance_for_authors(state, authors_list)
+        if isinstance(chance_clean, (int, float)):
+            upcoming[key]["win_chance_clean_percent"] = chance_clean
             
 def update_author_bets(state: dict, tips: list[dict]) -> None:
     """
@@ -670,10 +755,13 @@ def compute_effective_author_prob(state: dict, author: str) -> float | None:
 
     Возвращает p_eff в долях (0..1), или None, если данных нет.
     """
-def compute_effective_author_prob(state: dict, author: str) -> float | None:
     author_stats = state.get("author_stats") or {}
     stats = author_stats.get(author)
     if not stats:
+        return None
+
+    # считаем только если у автора нет "подвешенных" по времени ставок
+    if not author_ready_for_calc(state, author):
         return None
 
     wr = stats.get("win_rate_percent")
@@ -682,39 +770,27 @@ def compute_effective_author_prob(state: dict, author: str) -> float | None:
 
     # базовая вероятность из винрейта
     p = float(wr) / 100.0
-    # зажимаем на всякий случай
     p = max(0.0, min(1.0, p))
 
-    # крайние случаи
     if p <= 0.0:
         return 0.0
     if p >= 1.0:
         return 1.0
 
-    # длина текущей серии неудач автора
     streak = get_author_loss_streak(state, author)
 
-    # если свежая победа (или нет истории) — берём базовый p
     if streak <= 0:
         return p
 
-    # сколько ставок нужно, чтобы хотя бы одна была выигрышной с вероятностью >= 95%:
-    # 1 - (1 - p)^n >= 0.95  =>  (1 - p)^n <= 0.05  =>  n >= log(0.05) / log(1 - p)
     target = 0.95
     try:
         n95 = math.ceil(math.log(1.0 - target) / math.log(1.0 - p))
     except (ValueError, ZeroDivisionError):
-        # если что-то пошло не так с логарифмом — возвращаем базовый p
         return p
 
-    # Сколько "шансов" мы уже сжигали подряд (streak), текущая ставка — (streak+1)-я.
-    # Ограничиваем сверху n95, чтобы не уходить в бессмысленные сверх-гарантии.
     m = min(streak + 1, n95)
 
-    # Эффективная вероятность "хотя бы один win за m попыток":
     p_eff = 1.0 - (1.0 - p) ** m
-
-    # на всякий случай зажимаем
     p_eff = max(0.0, min(1.0, p_eff))
 
     return p_eff
@@ -942,4 +1018,4 @@ if __name__ == "__main__":
                 print(f"[ERROR] Критическая ошибка в check_profiles_once: {e}")
 
         print(f"[INFO] Сон {CHECK_INTERVAL_MINUTES} минут до следующей проверки...")
-        time.sleep(CHECK_INTERVAL_MINUTES * 15)
+        time.sleep(CHECK_INTERVAL_MINUTES * 60)
