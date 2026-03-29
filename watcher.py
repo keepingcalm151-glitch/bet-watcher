@@ -22,6 +22,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 import time
 import re
+import math
 
 # Часовые пояса
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
@@ -431,6 +432,48 @@ def get_kickoff_time_from_bettingexpert_tip(tip_url: str) -> datetime | None:
     return dt_local.astimezone(timezone.utc)
 # ===== 7. Память по будущим матчам (upcoming_matches) =====
 
+def compute_win_chance_for_authors(state: dict, authors: list[str]) -> float | None:
+    """
+    Считает шанс выигрыша ставки по формуле:
+      P = (∏ p_i) / (∏ p_i + ∏ (1 - p_i)),
+    где p_i — win rate автора (в долях, а не процентах).
+
+    Берёт p_i из state["author_stats"][author]["win_rate_percent"].
+    Возвращает шанс в процентах (0..100) или None, если посчитать не удалось.
+    """
+    author_stats = state.get("author_stats") or {}
+    ps: list[float] = []
+
+    for author in authors:
+        stats = author_stats.get(author)
+        if not stats:
+            continue
+        wr = stats.get("win_rate_percent")
+        if not isinstance(wr, (int, float)):
+            continue
+
+        # win rate 0..100 -> 0..1 и зажимаем в границах
+        p = max(0.0, min(1.0, float(wr) / 100.0))
+        ps.append(p)
+
+    # Если нет ни одного автора с известным win rate — нечего считать
+    if not ps:
+        return None
+
+    # ∏ p_i и ∏ (1 - p_i)
+    prod_p = 1.0
+    prod_not = 1.0
+    for p in ps:
+        prod_p *= p
+        prod_not *= (1.0 - p)
+
+    denom = prod_p + prod_not
+    if denom <= 0:
+        return None
+
+    chance = prod_p / denom  # 0..1
+    return chance * 100.0    # в процентах
+
 def update_upcoming_matches(state: dict, tips: list[dict]) -> None:
     """
     Обновляет state["upcoming_matches"] по новым прогнозам.
@@ -478,10 +521,16 @@ def update_upcoming_matches(state: dict, tips: list[dict]) -> None:
                 "notified": False,
             }
 
+        # Обновляем список авторов и коэффициентов
         if author not in upcoming[key]["authors"]:
             upcoming[key]["authors"].append(author)
         if isinstance(odds, (int, float)):
             upcoming[key]["odds_list"].append(odds)
+
+        # Считаем шанс выигрыша по win rate авторов (если есть данные)
+        chance = compute_win_chance_for_authors(state, upcoming[key]["authors"])
+        if isinstance(chance, (int, float)):
+            upcoming[key]["win_chance_percent"] = chance
             
 def update_author_bets(state: dict, tips: list[dict]) -> None:
     """
