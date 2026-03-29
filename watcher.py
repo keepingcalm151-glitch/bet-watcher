@@ -434,33 +434,26 @@ def get_kickoff_time_from_bettingexpert_tip(tip_url: str) -> datetime | None:
 
 def compute_win_chance_for_authors(state: dict, authors: list[str]) -> float | None:
     """
-    Считает шанс выигрыша ставки по формуле:
-      P = (∏ p_i) / (∏ p_i + ∏ (1 - p_i)),
-    где p_i — win rate автора (в долях, а не процентах).
+    Считает шанс выигрыша ставки с учётом:
+      - эффективных вероятностей авторов (win rate + серия неудач),
+      - комбинирования авторов по формуле:
 
-    Берёт p_i из state["author_stats"][author]["win_rate_percent"].
-    Возвращает шанс в процентах (0..100) или None, если посчитать не удалось.
+          P = (∏ p_i) / (∏ p_i + ∏ (1 - p_i))
+
+    Возвращает шанс в процентах (0..100) или None.
     """
-    author_stats = state.get("author_stats") or {}
     ps: list[float] = []
 
     for author in authors:
-        stats = author_stats.get(author)
-        if not stats:
-            continue
-        wr = stats.get("win_rate_percent")
-        if not isinstance(wr, (int, float)):
-            continue
+        p_eff = compute_effective_author_prob(state, author)
+        if isinstance(p_eff, (int, float)):
+            # зажимаем 0..1
+            p_eff = max(0.0, min(1.0, float(p_eff)))
+            ps.append(p_eff)
 
-        # win rate 0..100 -> 0..1 и зажимаем в границах
-        p = max(0.0, min(1.0, float(wr) / 100.0))
-        ps.append(p)
-
-    # Если нет ни одного автора с известным win rate — нечего считать
     if not ps:
         return None
 
-    # ∏ p_i и ∏ (1 - p_i)
     prod_p = 1.0
     prod_not = 1.0
     for p in ps:
@@ -468,7 +461,7 @@ def compute_win_chance_for_authors(state: dict, authors: list[str]) -> float | N
         prod_not *= (1.0 - p)
 
     denom = prod_p + prod_not
-    if denom <= 0:
+    if denom <= 0.0:
         return None
 
     chance = prod_p / denom  # 0..1
@@ -580,6 +573,151 @@ def update_author_bets(state: dict, tips: list[dict]) -> None:
             "updated_at": now_iso,
         }
 # ===== 8. Обработка отложенных матчей и отправка уведомлений =====
+
+def author_ready_for_calc(state: dict, author: str) -> bool:
+    """
+    Автор допускается к расчёту шанса только если
+    все его ставки с kickoff <= сейчас уже имеют результат (result не None).
+
+    Если есть хотя бы одна прошедшая по времени ставка без result,
+    возвращаем False.
+    """
+    bets_by_author = state.get("bets_by_author") or {}
+    author_bets = bets_by_author.get(author) or {}
+    if not author_bets:
+        # нет истории — считаем, что нельзя оценивать
+        return False
+
+    now_utc = datetime.now(timezone.utc)
+
+    for bet in author_bets.values():
+        kickoff_str = bet.get("kickoff")
+        if not kickoff_str:
+            # без времени матча — тоже считаем, что не всё понятно
+            return False
+
+        try:
+            kickoff_dt = datetime.fromisoformat(kickoff_str)
+        except Exception:
+            return False
+
+        if kickoff_dt.tzinfo is None:
+            kickoff_dt = kickoff_dt.replace(tzinfo=timezone.utc)
+
+        # если матч уже должен был начаться / закончиться
+        if kickoff_dt <= now_utc:
+            # и при этом нет result — значит, есть незаконченная по данным ставка
+            if bet.get("result") is None:
+                return False
+
+    return True
+
+def get_author_loss_streak(state: dict, author: str) -> int:
+    """
+    Возвращает длину текущей серии неудач автора:
+      - считаем с последней ставки назад,
+      - "won" обрывает серию,
+      - "lost" и прочие (кроме "void") увеличивают,
+      - "void" просто пропускаем.
+    """
+    bets_by_author = state.get("bets_by_author") or {}
+    author_bets = bets_by_author.get(author) or {}
+
+    if not author_bets:
+        return 0
+
+    # сортируем ставки с новейших к старым по kickoff (если есть) или updated_at
+    def parse_dt(s: str | None) -> datetime:
+        if not s:
+            return datetime.min.replace(tzinfo=timezone.utc)
+        try:
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except Exception:
+            return datetime.min.replace(tzinfo=timezone.utc)
+
+    bets = list(author_bets.values())
+    bets.sort(
+        key=lambda b: (
+            parse_dt(b.get("kickoff")),
+            parse_dt(b.get("updated_at")),
+        ),
+        reverse=True,
+    )
+
+    streak = 0
+    for bet in bets:
+        res = (bet.get("result") or "").lower()
+        if res == "won":
+            break
+        if res in ("void", "returned", "refunded", "push"):
+            # возвраты не считаем ни за win, ни за lose
+            continue
+        # всё, что не win и не void — считаем как неудачу
+        streak += 1
+
+    return streak
+    
+def compute_effective_author_prob(state: dict, author: str) -> float | None:
+    """
+    Считает эффективную вероятность выигрыша для автора с учётом:
+      - базового win rate (как на сайте),
+      - серии прошлых неудач,
+      - целевой уверенности 95% по формуле:
+          1 - (1 - p)^n >= 0.95.
+
+    Возвращает p_eff в долях (0..1), или None, если данных нет.
+    """
+def compute_effective_author_prob(state: dict, author: str) -> float | None:
+    author_stats = state.get("author_stats") or {}
+    stats = author_stats.get(author)
+    if not stats:
+        return None
+
+    wr = stats.get("win_rate_percent")
+    if not isinstance(wr, (int, float)):
+        return None
+
+    # базовая вероятность из винрейта
+    p = float(wr) / 100.0
+    # зажимаем на всякий случай
+    p = max(0.0, min(1.0, p))
+
+    # крайние случаи
+    if p <= 0.0:
+        return 0.0
+    if p >= 1.0:
+        return 1.0
+
+    # длина текущей серии неудач автора
+    streak = get_author_loss_streak(state, author)
+
+    # если свежая победа (или нет истории) — берём базовый p
+    if streak <= 0:
+        return p
+
+    # сколько ставок нужно, чтобы хотя бы одна была выигрышной с вероятностью >= 95%:
+    # 1 - (1 - p)^n >= 0.95  =>  (1 - p)^n <= 0.05  =>  n >= log(0.05) / log(1 - p)
+    target = 0.95
+    try:
+        n95 = math.ceil(math.log(1.0 - target) / math.log(1.0 - p))
+    except (ValueError, ZeroDivisionError):
+        # если что-то пошло не так с логарифмом — возвращаем базовый p
+        return p
+
+    # Сколько "шансов" мы уже сжигали подряд (streak), текущая ставка — (streak+1)-я.
+    # Ограничиваем сверху n95, чтобы не уходить в бессмысленные сверх-гарантии.
+    m = min(streak + 1, n95)
+
+    # Эффективная вероятность "хотя бы один win за m попыток":
+    p_eff = 1.0 - (1.0 - p) ** m
+
+    # на всякий случай зажимаем
+    p_eff = max(0.0, min(1.0, p_eff))
+
+    return p_eff
 
 def update_author_stats(state: dict, author: str, win_rate: float | None) -> None:
     """
