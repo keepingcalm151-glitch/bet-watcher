@@ -926,6 +926,10 @@ def process_upcoming_matches(state: dict) -> None:
         kickoff_str = info.get("kickoff")
         authors = info.get("authors") or []
         odds_list = info.get("odds_list") or []
+        # Три варианта шансов (могут отсутствовать)
+        chance_pure = info.get("win_chance_pure_percent")
+        chance_dirty = info.get("win_chance_dirty_percent")
+        chance_clean = info.get("win_chance_clean_percent")
 
         if not kickoff_str:
             continue
@@ -969,13 +973,30 @@ def process_upcoming_matches(state: dict) -> None:
         authors_lines = [f"{author} — {short_sel}" for author in unique_authors]
         authors_block = "\n".join(authors_lines)
 
-        part = (
-            f"<b>Матч:</b> {match}\n"
-            f"Время (МСК): {kickoff_human}\n"
-            f"{authors_block}\n"
-            f"Средний кэф: {odds_str}\n"
-            f"{'-'*40}"
-        )
+        # Формируем строки с шансами, если они посчитаны
+        lines = [
+            f"<b>Матч:</b> {match}",
+            f"Время (МСК): {kickoff_human}",
+            authors_block,
+            f"Средний кэф: {odds_str}",
+        ]
+
+        # 1) Чистый winrate
+        if isinstance(chance_pure, (int, float)):
+            lines.append(f"Шанс по winrate: {chance_pure:.1f}%")
+
+        # 2) Грязный счёт (авторы с подвешенными матчами)
+        if isinstance(chance_dirty, (int, float)):
+            lines.append(f"Шанс по грязным авторам: {chance_dirty:.1f}%")
+
+        # 3) Чистый подсчёт (полная история + серии)
+        if isinstance(chance_clean, (int, float)):
+            lines.append(f"Шанс с учётом истории: {chance_clean:.1f}%")
+
+        lines.append("-" * 40)
+
+        part = "\n".join(lines)
+
         parts.append(part)
 
         # Помечаем как уже уведомлённый, чтобы второй раз не шлём
