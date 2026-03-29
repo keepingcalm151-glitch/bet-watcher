@@ -61,7 +61,7 @@ TELEGRAM_BOT_TOKEN = config["telegram_bot_token"]
 TELEGRAM_CHAT_ID = config["telegram_chat_id"]
 THESPORTSDB_KEY = config.get("thesportsdb_key")     # опционально, оставим на будущее
 SITES = config["sites"]                             # профили bettingexpert
-CHECK_INTERVAL_MINUTES = config.get("check_interval_minutes", 59)
+CHECK_INTERVAL_MINUTES = config.get("check_interval_minutes", 15)
 
 
 # ===== 2. Работа с локальным состоянием (state.json) =====
@@ -942,4 +942,4 @@ if __name__ == "__main__":
                 print(f"[ERROR] Критическая ошибка в check_profiles_once: {e}")
 
         print(f"[INFO] Сон {CHECK_INTERVAL_MINUTES} минут до следующей проверки...")
-        time.sleep(CHECK_INTERVAL_MINUTES * 60)
+        time.sleep(CHECK_INTERVAL_MINUTES * 15)
