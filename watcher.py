@@ -833,15 +833,13 @@ def compute_effective_author_prob(state: dict, author: str) -> float | None:
       - целевой уверенности 95% по формуле:
           1 - (1 - p)^n >= 0.95.
 
-    Возвращает p_eff в долях (0..1), или None, если данных нет.
+    ВАЖНО: теперь считаем p_eff даже если у автора есть "подвешенные"
+    матчи (author_ready_for_calc может быть False) — достаточно того,
+    что у автора есть win rate.
     """
     author_stats = state.get("author_stats") or {}
     stats = author_stats.get(author)
     if not stats:
-        return None
-
-    # считаем только если у автора нет "подвешенных" по времени ставок
-    if not author_ready_for_calc(state, author):
         return None
 
     wr = stats.get("win_rate_percent")
@@ -857,6 +855,7 @@ def compute_effective_author_prob(state: dict, author: str) -> float | None:
     if p >= 1.0:
         return 1.0
 
+    # серия неудач считаем как раньше
     streak = get_author_loss_streak(state, author)
 
     if streak <= 0:
