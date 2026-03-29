@@ -464,7 +464,15 @@ def process_upcoming_matches(state: dict) -> None:
             kickoff_utc = kickoff_utc.replace(tzinfo=timezone.utc)
 
         kickoff_msk = kickoff_utc.astimezone(MOSCOW_TZ)
+
+        # 1) матч должен быть в тот же календарный день по МСК
+        if kickoff_msk.date() != now_msk.date():
+            continue
+
+        # 2) дальше проверяем окно по времени
         delta = kickoff_msk - now_msk
+        if not (-max_after <= delta <= max_before):
+            continue
 
         # Условие "окна": от -40 до +80 минут относительно текущего времени
         if not (-max_after <= delta <= max_before):
