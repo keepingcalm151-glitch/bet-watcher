@@ -314,6 +314,7 @@ def parse_bettingexpert_tips(html: str, profile_name: str, profile_url: str) -> 
                 "odds": odds,
                 "author": author,
                 "tip_url": tip_url,
+                "result": result,  # <-- добавили результат
             }
         )
 
@@ -446,6 +447,54 @@ def update_upcoming_matches(state: dict, tips: list[dict]) -> None:
             upcoming[key]["authors"].append(author)
         if isinstance(odds, (int, float)):
             upcoming[key]["odds_list"].append(odds)
+            
+def update_author_bets(state: dict, tips: list[dict]) -> None:
+    """
+    Обновляет state["bets_by_author"] по завершённым ставкам (есть result).
+
+    Структура:
+      state["bets_by_author"] = {
+        "Pacopick": {
+          "https://www.bettingexpert.com/...": {
+              "match": "...",
+              "selection": "...",
+              "odds": 1.93,
+              "result": "won" | "lost" | "void" | др.,
+              "kickoff": "2026-03-29T12:00:00+00:00",
+              "updated_at": "2026-03-29T10:15:00+00:00",
+          },
+          ...
+        },
+        "Dyole": {
+          ...
+        },
+        ...
+      }
+    tip_url используем как уникальный ключ ставки для автора.
+    """
+    bets_by_author = state.setdefault("bets_by_author", {})
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    for tip in tips:
+        author = tip.get("author")
+        tip_url = tip.get("tip_url")
+        result = tip.get("result")
+
+        # Нужны автор, url и непустой result (won/lost/void/...)
+        if not author or not tip_url or not result:
+            continue
+
+        author_bets = bets_by_author.setdefault(author, {})
+
+        # Обновляем/создаём запись по конкретной ставке
+        author_bets[tip_url] = {
+            "match": tip.get("match"),
+            "selection": tip.get("selection"),
+            "odds": tip.get("odds"),
+            "result": result,
+            "kickoff": tip.get("kickoff_time_utc"),
+            "updated_at": now_iso,
+        }
 # ===== 8. Обработка отложенных матчей и отправка уведомлений =====
 
 def process_upcoming_matches(state: dict) -> None:
@@ -601,6 +650,9 @@ def check_profiles_once() -> None:
         )
 
         all_enriched_tips.extend(enriched)
+
+    # Обновляем статистику ставок по авторам (завершённые ставки с result)
+    update_author_bets(state, all_enriched_tips)
 
     # Обновляем память о будущих матчах (до 7 дней вперёд)
     update_upcoming_matches(state, all_enriched_tips)
