@@ -502,57 +502,6 @@ def compute_win_chance_from_winrate_only(state: dict, authors: list[str]) -> flo
     chance = prod_p / denom
     return chance * 100.0
 
-def compute_win_chance_after_losses(state: dict, authors: list[str]) -> float | None:
-    """
-    Считает шанс выигрыша ставки, если до этого у авторов были поражения.
-    Берём только тех авторов, у кого текущая серия неудач > 0,
-    и для каждого повышаем вероятность по формуле:
-        p_eff = 1 - (1 - p) ** (streak + 1)
-
-    Возвращает шанс в процентах (0..100) или None.
-    """
-    author_stats = state.get("author_stats") or {}
-    ps: list[float] = []
-
-    for author in authors:
-        stats = author_stats.get(author)
-        if not stats:
-            continue
-
-        wr = stats.get("win_rate_percent")
-        if not isinstance(wr, (int, float)):
-            continue
-
-        streak = get_author_loss_streak(state, author)
-        if streak <= 0:
-            # если у автора нет текущей серии лузов – в этот расчёт не берём
-            continue
-
-        p = max(0.0, min(1.0, float(wr) / 100.0))
-
-        # эффективная вероятность после серии неудач
-        m = streak + 1
-        p_eff = 1.0 - (1.0 - p) ** m
-        p_eff = max(0.0, min(1.0, p_eff))
-        ps.append(p_eff)
-
-    if not ps:
-        return None
-
-    # комбинируем авторов
-    prod_p = 1.0
-    prod_not = 1.0
-    for p in ps:
-        prod_p *= p
-        prod_not *= (1.0 - p)
-
-    denom = prod_p + prod_not
-    if denom <= 0.0:
-        return None
-
-    chance = prod_p / denom
-    return chance * 100.0
-
 def update_upcoming_matches(state: dict, tips: list[dict]) -> None:
     """
     Обновляет state["upcoming_matches"] по новым прогнозам.
@@ -621,11 +570,6 @@ def update_upcoming_matches(state: dict, tips: list[dict]) -> None:
         chance_pure = compute_win_chance_from_winrate_only(state, authors_list)
         if isinstance(chance_pure, (int, float)):
             upcoming[key]["win_chance_pure_percent"] = chance_pure
-
-        # 2) Шанс после прошлых поражений
-        chance_after_loss = compute_win_chance_after_losses(state, authors_list)
-        if isinstance(chance_after_loss, (int, float)):
-            upcoming[key]["win_chance_after_loss_percent"] = chance_after_loss
 
 def update_author_bets(state: dict, tips: list[dict]) -> None:
     """
@@ -778,11 +722,9 @@ def process_upcoming_matches(state: dict) -> None:
         period = info.get("period")  # может быть None
         # Чистый winrate (единственный обязательный шанс)
         chance_pure = info.get("win_chance_pure_percent")
-        # Шанс после прошлых поражений (опционально)
-        chance_after_loss = info.get("win_chance_after_loss_percent")
 
-        # Если пока нет шанса по winrate — не шлём уведомление
-        if not isinstance(chance_pure, (int, float)):
+        # Если нет шанса по winrate или он < 60% — не шлём уведомление
+        if not isinstance(chance_pure, (int, float)) or chance_pure < 60.0:
             continue
 
 
@@ -847,10 +789,6 @@ def process_upcoming_matches(state: dict) -> None:
 
         # Шанс по чистому winrate (основной)
         lines.append(f"Шанс по winrate: {chance_pure:.1f}%")
-
-        # Если расчёт "после прошлых поражений" есть и >80% — показываем отдельной строкой
-        if isinstance(chance_after_loss, (int, float)) and chance_after_loss > 80.0:
-            lines.append(f"Шанс после прошлых поражений: {chance_after_loss:.1f}%")
 
         lines.append("-" * 40)
 
