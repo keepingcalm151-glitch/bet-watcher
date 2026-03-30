@@ -22,6 +22,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 import time
 import re
+import random
 
 # Часовые пояса
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
@@ -118,6 +119,168 @@ def send_telegram_message(text: str) -> None:
     }
     resp = requests.post(url, json=payload, timeout=30)
     resp.raise_for_status()
+
+# ===== 4. Winline: сессия и парсер коэффициентов по конфигу =====
+
+WINLINE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0 Safari/537.36"
+    ),
+    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+}
+
+winline_session = requests.Session()
+winline_session.headers.update(WINLINE_HEADERS)
+
+
+def fetch_winline_page(url: str) -> str:
+    """
+    Скачиваем HTML страницы матча Winline через отдельную сессию.
+    """
+    resp = winline_session.get(url, timeout=15)
+    resp.raise_for_status()
+    return resp.text
+
+
+def get_winline_odds_by_selector(url: str, selector: dict) -> float | None:
+    """
+    Скачивает страницу матча Winline и ищет коэффициент по описанию в selector.
+
+    Ожидаем формат:
+      selector = {
+        "type": "row-index",
+        "row_label": "Исход 1X2",
+        "button_index": 0   # 0: П1, 1: X, 2: П2
+      }
+    Идея: находим блок с заголовком row_label и берём button_index-ю кнопку coef-btn.
+    """
+    try:
+        html = fetch_winline_page(url)
+    except Exception as e:
+        print(f"[WARN] Winline: не удалось скачать {url}: {e}")
+        return None
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    sel_type = (selector or {}).get("type", "row-index")
+    row_label = (selector or {}).get("row_label")
+    button_index = (selector or {}).get("button_index", 0)
+
+    if sel_type != "row-index" or not row_label:
+        return None
+
+    # ищем блок, где есть заголовок с row_label ("Исход 1X2", "Тотал 2.5" и т.п.)
+    # сначала ищем элементы, содержащие этот текст
+    label_candidates = soup.find_all(
+        lambda tag: tag.get_text(" ", strip=True).find(row_label) != -1
+    )
+
+    for label in label_candidates:
+        # поднимаемся к родителю/контейнеру строки
+        row_container = label
+        # ограничимся парой подъёмов вверх
+        for _ in range(3):
+            if not row_container.parent:
+                break
+            row_container = row_container.parent
+
+        # внутри контейнера ищем все кнопки с coef-btn
+        coef_buttons = row_container.find_all(
+            lambda tag: tag.get("class")
+            and any("coef-btn" in cls for cls in tag.get("class", []))
+        )
+        if not coef_buttons:
+            continue
+
+        if not (0 <= button_index < len(coef_buttons)):
+            continue
+
+        coef_el = coef_buttons[button_index]
+        text = coef_el.get_text(" ", strip=True).replace(",", ".")
+        m = re.search(r"(\d+(?:\.\d+)?)", text)
+        if not m:
+            continue
+
+        try:
+            val = float(m.group(1))
+        except ValueError:
+            continue
+
+        if 1.01 <= val <= 100.0:
+            return val
+
+    return None
+
+
+def process_winline_watch_list(state: dict) -> None:
+    """
+    Проходит по конфигу winline_watch и для каждого матча:
+      - забирает текущий кэф с Winline,
+      - если он >= min_odds (из конфига), шлёт уведомление один раз.
+    """
+    WINLINE_WATCH = config.get("winline_watch", [])
+    if not WINLINE_WATCH:
+        return
+
+    watched = state.setdefault("winline_notified", {})
+
+    parts: list[str] = []
+
+    now_msk_str = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M")
+
+    for item in WINLINE_WATCH:
+        name = item.get("name") or "Без названия"
+        url = item.get("url")
+        selector = item.get("selector") or {}
+        min_odds = item.get("min_odds")
+
+        if not url:
+            continue
+
+        # ключ для "уже уведомлял"
+        key = f"{name}|||{url}"
+
+        if watched.get(key):
+            # уже отправляли сигнал по этому условию – пропускаем
+            continue
+
+        current_odds = get_winline_odds_by_selector(url, selector)
+        if not isinstance(current_odds, (int, float)):
+            continue
+
+        # если порог не задан — просто логируем, но не шлём
+        if not isinstance(min_odds, (int, float)):
+            print(f"[INFO] {name}: текущий кэф {current_odds:.2f} (порог не задан)")
+            continue
+
+        if current_odds < min_odds:
+            print(
+                f"[INFO] {name}: текущий кэф {current_odds:.2f} < порога {min_odds:.2f}"
+            )
+            continue
+
+        # условие выполнено – добавляем в уведомление
+        lines = [
+            f"<b>Winline сигнал:</b> {name}",
+            f"Время проверки (МСК): {now_msk_str}",
+            f"Текущий кэф: {current_odds:.2f}",
+            f"Пороговый кэф: {min_odds:.2f}",
+            f"Ссылка: {url}",
+            "-" * 40,
+        ]
+        parts.append("\n".join(lines))
+        watched[key] = True  # помечаем, что уже уведомили по этому условию
+
+    if parts:
+        full_message = "\n\n".join(parts)
+        try:
+            send_telegram_message(full_message)
+            print("[INFO] Уведомление по Winline_watch отправлено.")
+        except Exception as e:
+            print(f"[ERROR] Не удалось отправить Winline_watch сообщение: {e}")
+
 # ===== 4. Короткая запись ставки (П1, П2, Ф1, ТБ и т.д.) =====
 
 def normalize_selection_for_grouping(selection: str) -> str:
@@ -933,6 +1096,10 @@ def check_profiles_once() -> None:
 # ===== 10. Точка входа (главный цикл) =====
 
 if __name__ == "__main__":
+    last_profiles_check = 0.0
+    PROFILES_PERIOD = CHECK_INTERVAL_MINUTES * 60.0
+    LIVE_PERIOD = 15.0  # базовый шаг для проверки Winline (секунды)
+
     while True:
         now_moscow = datetime.now(MOSCOW_TZ)
         hour = now_moscow.hour
@@ -943,7 +1110,13 @@ if __name__ == "__main__":
                 f"[INFO] {now_moscow.strftime('%Y-%m-%d %H:%M')} МСК. "
                 f"Ночной режим, проверки не выполняем."
             )
-        else:
+            time.sleep(60)
+            continue
+
+        now_ts = time.time()
+
+        # Раз в PROFILES_PERIOD обновляем профили bettingexpert
+        if now_ts - last_profiles_check >= PROFILES_PERIOD:
             print(
                 f"[INFO] Запуск проверки профилей "
                 f"(МСК: {now_moscow.strftime('%Y-%m-%d %H:%M')})..."
@@ -952,6 +1125,17 @@ if __name__ == "__main__":
                 check_profiles_once()
             except Exception as e:
                 print(f"[ERROR] Критическая ошибка в check_profiles_once: {e}")
+            last_profiles_check = now_ts
 
-        print(f"[INFO] Сон {CHECK_INTERVAL_MINUTES} минут до следующей проверки...")
-        time.sleep(CHECK_INTERVAL_MINUTES * 60)
+        # Быстрая проверка Winline по конфигу
+        state = load_state()
+        try:
+            process_winline_watch_list(state)
+            save_state(state)
+        except Exception as e:
+            print(f"[ERROR] Ошибка в process_winline_watch_list: {e}")
+
+        # Рандом вокруг 15 секунд, чтобы не тикать идеально ровно
+        sleep_sec = random.uniform(LIVE_PERIOD * 0.8, LIVE_PERIOD * 1.2)
+        print(f"[INFO] Сон {sleep_sec:.1f} секунд до следующей проверки...")
+        time.sleep(sleep_sec)
