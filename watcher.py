@@ -117,6 +117,25 @@ def send_telegram_message(text: str) -> None:
     resp.raise_for_status()
 # ===== 4. Короткая запись ставки (П1, П2, Ф1, ТБ и т.д.) =====
 
+def normalize_selection_for_grouping(selection: str) -> str:
+    """
+    Нормализует ставку для группировки похожих исходов:
+    например, "Armenia U19 (-2) (EH)" и "Armenia U19 (-3) (EH)"
+    превратятся в один базовый ключ "Armenia U19 (EH)".
+    """
+    if not selection:
+        return ""
+    text = selection.strip()
+
+    # EH-хендикап: "<Team> (-3) (EH)" -> "<Team> (EH)"
+    m = re.match(r"(.+?)\s*\([+-]?\d+(\.\d+)?\)\s*\(EH\)", text)
+    if m:
+        team = m.group(1).strip()
+        return f"{team} (EH)"
+
+    # иначе оставляем как есть
+    return text
+
 def short_selection(selection: str, match: str | None = None) -> str:
     """
     Делает короткую запись ставки из длинного текста selection.
@@ -570,15 +589,18 @@ def update_upcoming_matches(state: dict, tips: list[dict]) -> None:
             # слишком далеко или уже прошло
             continue
 
-        key = f"{match}|||{selection}"
+        # Нормализуем selection для группировки похожих ставок
+        norm_selection = normalize_selection_for_grouping(selection)
+        key = f"{match}|||{norm_selection}"
 
         if key not in upcoming:
             upcoming[key] = {
                 "match": match,
-                "selection": selection,
-                "period": period,   # <-- и вот здесь сохраняем период
+                "selection": norm_selection,   # базовый вариант для группы
+                "period": period,
                 "kickoff": kickoff,   # ISO‑строка в UTC
                 "authors": [],
+                "author_selections": {},  # выборы по авторам
                 "odds_list": [],
                 "notified": False,
             }
@@ -588,6 +610,10 @@ def update_upcoming_matches(state: dict, tips: list[dict]) -> None:
             upcoming[key]["authors"].append(author)
         if isinstance(odds, (int, float)):
             upcoming[key]["odds_list"].append(odds)
+
+        # Сохраняем ИМЕННО его исход (чтобы позже показать -2 или -3)
+        author_selections = upcoming[key].setdefault("author_selections", {})
+        author_selections[author] = selection
 
         authors_list = upcoming[key]["authors"]
 
@@ -796,20 +822,18 @@ def process_upcoming_matches(state: dict) -> None:
 
         kickoff_human = kickoff_msk.strftime("%Y-%m-%d %H:%M")
 
-        # Короткая запись выборa (П1, Ф1, ТБ и т.п.)
-        short_sel = short_selection(selection, match)
+        # Карта исходов по авторам (сохранили в update_upcoming_matches)
+        author_selections = info.get("author_selections") or {}
 
-        # Если период/тайм известен — добавляем его в скобках
-        if period:
-            authors_lines = [
-                f"{author} — {short_sel} ({period})"
-                for author in unique_authors
-            ]
-        else:
-            authors_lines = [
-                f"{author} — {short_sel}"
-                for author in unique_authors
-            ]
+        # Для каждого автора считаем short_selection из его исхода
+        authors_lines = []
+        for author in unique_authors:
+            sel_for_author = author_selections.get(author, selection)
+            sel_short = short_selection(sel_for_author, match)
+            if period:
+                authors_lines.append(f"{author} — {sel_short} ({period})")
+            else:
+                authors_lines.append(f"{author} — {sel_short}")
 
         authors_block = "\n".join(authors_lines)
 
