@@ -466,7 +466,58 @@ def compute_win_chance_from_winrate_only(state: dict, authors: list[str]) -> flo
 
     chance = prod_p / denom
     return chance * 100.0
-    
+
+def compute_win_chance_after_losses(state: dict, authors: list[str]) -> float | None:
+    """
+    Считает шанс выигрыша ставки, если до этого у авторов были поражения.
+    Берём только тех авторов, у кого текущая серия неудач > 0,
+    и для каждого повышаем вероятность по формуле:
+        p_eff = 1 - (1 - p) ** (streak + 1)
+
+    Возвращает шанс в процентах (0..100) или None.
+    """
+    author_stats = state.get("author_stats") or {}
+    ps: list[float] = []
+
+    for author in authors:
+        stats = author_stats.get(author)
+        if not stats:
+            continue
+
+        wr = stats.get("win_rate_percent")
+        if not isinstance(wr, (int, float)):
+            continue
+
+        streak = get_author_loss_streak(state, author)
+        if streak <= 0:
+            # если у автора нет текущей серии лузов – в этот расчёт не берём
+            continue
+
+        p = max(0.0, min(1.0, float(wr) / 100.0))
+
+        # эффективная вероятность после серии неудач
+        m = streak + 1
+        p_eff = 1.0 - (1.0 - p) ** m
+        p_eff = max(0.0, min(1.0, p_eff))
+        ps.append(p_eff)
+
+    if not ps:
+        return None
+
+    # комбинируем авторов
+    prod_p = 1.0
+    prod_not = 1.0
+    for p in ps:
+        prod_p *= p
+        prod_not *= (1.0 - p)
+
+    denom = prod_p + prod_not
+    if denom <= 0.0:
+        return None
+
+    chance = prod_p / denom
+    return chance * 100.0
+
 def compute_win_chance_dirty_authors(state: dict, authors: list[str]) -> tuple[float | None, list[dict]]:
     """
     Вероятность ставки по авторам с неполной историей ("грязные" авторы):
@@ -621,23 +672,16 @@ def update_upcoming_matches(state: dict, tips: list[dict]) -> None:
 
         authors_list = upcoming[key]["authors"]
 
-        # 1) Чистый winrate (не учитывает серии и "грязность")
+        # 1) Чистый winrate (не учитывает серии)
         chance_pure = compute_win_chance_from_winrate_only(state, authors_list)
         if isinstance(chance_pure, (int, float)):
             upcoming[key]["win_chance_pure_percent"] = chance_pure
 
-        # 2) Только по грязным авторам + список матчей без результата
-        chance_dirty, dirty_pending = compute_win_chance_dirty_authors(state, authors_list)
-        if isinstance(chance_dirty, (int, float)):
-            upcoming[key]["win_chance_dirty_percent"] = chance_dirty
-        if dirty_pending:
-            upcoming[key]["win_chance_dirty_pending_matches"] = dirty_pending
+        # 2) Шанс после прошлых поражений
+        chance_after_loss = compute_win_chance_after_losses(state, authors_list)
+        if isinstance(chance_after_loss, (int, float)):
+            upcoming[key]["win_chance_after_loss_percent"] = chance_after_loss
 
-        # 3) Чистый подсчёт (только по авторам с полной историей, с сериями)
-        chance_clean = compute_win_chance_for_authors(state, authors_list)
-        if isinstance(chance_clean, (int, float)):
-            upcoming[key]["win_chance_clean_percent"] = chance_clean
-            
 def update_author_bets(state: dict, tips: list[dict]) -> None:
     """
     Обновляет state["bets_by_author"] по завершённым ставкам (есть result).
@@ -988,17 +1032,15 @@ def process_upcoming_matches(state: dict) -> None:
         kickoff_str = info.get("kickoff")
         authors = info.get("authors") or []
         odds_list = info.get("odds_list") or []
-        # Три варианта шансов (могут отсутствовать)
+        # Чистый winrate (единственный обязательный шанс)
         chance_pure = info.get("win_chance_pure_percent")
-        chance_dirty = info.get("win_chance_dirty_percent")
-        chance_clean = info.get("win_chance_clean_percent")
-        
-        # Если пока не посчитан ни один из шансов — не шлём уведомление
-        if not any(
-            isinstance(x, (int, float))
-            for x in (chance_pure, chance_dirty, chance_clean)
-        ):
+        # Шанс после прошлых поражений (опционально)
+        chance_after_loss = info.get("win_chance_after_loss_percent")
+
+        # Если пока нет шанса по winrate — не шлём уведомление
+        if not isinstance(chance_pure, (int, float)):
             continue
+
 
         if not kickoff_str:
             continue
@@ -1050,43 +1092,12 @@ def process_upcoming_matches(state: dict) -> None:
             f"Средний кэф: {odds_str}",
         ]
 
-        # 1) Чистый winrate
-        if isinstance(chance_pure, (int, float)):
-            lines.append(f"Шанс по winrate: {chance_pure:.1f}%")
+        # Шанс по чистому winrate (основной)
+        lines.append(f"Шанс по winrate: {chance_pure:.1f}%")
 
-        # 2) Грязный счёт (авторы с подвешенными матчами)
-        if isinstance(chance_dirty, (int, float)):
-            lines.append(f"Шанс по грязным авторам: {chance_dirty:.1f}%")
-
-        # 3) Чистый подсчёт (полная история + серии)
-        if isinstance(chance_clean, (int, float)):
-            lines.append(f"Шанс с учётом истории: {chance_clean:.1f}%")
-
-        # Список грязных матчей (подвешенные ставки авторов)
-        dirty_pending = info.get("win_chance_dirty_pending_matches") or []
-        if dirty_pending:
-            lines.append("Грязные матчи (подвешенные ставки авторов):")
-            for dm in dirty_pending:
-                a = dm.get("author") or "автор неизвестен"
-                m_name = dm.get("match") or "матч неизвестен"
-                sel = dm.get("selection") or "ставка не указана"
-                k_str = dm.get("kickoff")
-
-                if k_str:
-                    try:
-                        k_dt_utc = datetime.fromisoformat(k_str)
-                        if k_dt_utc.tzinfo is None:
-                            k_dt_utc = k_dt_utc.replace(tzinfo=timezone.utc)
-                        k_dt_msk = k_dt_utc.astimezone(MOSCOW_TZ)
-                        k_human = k_dt_msk.strftime("%Y-%m-%d %H:%M")
-                    except Exception:
-                        k_human = k_str
-                else:
-                    k_human = "неизвестно"
-
-                lines.append(
-                    f"  • {a}: {m_name} — {sel} (МСК: {k_human})"
-                )
+        # Если расчёт "после прошлых поражений" есть и >80% — показываем отдельной строкой
+        if isinstance(chance_after_loss, (int, float)) and chance_after_loss > 80.0:
+            lines.append(f"Шанс после прошлых поражений: {chance_after_loss:.1f}%")
 
         lines.append("-" * 40)
 
