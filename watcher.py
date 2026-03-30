@@ -724,7 +724,7 @@ def process_upcoming_matches(state: dict) -> None:
         chance_pure = info.get("win_chance_pure_percent")
 
         # Если нет шанса по winrate или он < 60% — не шлём уведомление
-        if not isinstance(chance_pure, (int, float)) or chance_pure < 60.0:
+        if not isinstance(chance_pure, (int, float)) or chance_pure < 55.0:
             continue
 
 
