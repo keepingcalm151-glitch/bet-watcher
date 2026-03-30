@@ -61,7 +61,10 @@ TELEGRAM_CHAT_ID = config["telegram_chat_id"]
 THESPORTSDB_KEY = config.get("thesportsdb_key")     # опционально, оставим на будущее
 SITES = config["sites"]                             # профили bettingexpert
 CHECK_INTERVAL_MINUTES = config.get("check_interval_minutes", 15)
-
+# Параметры банка для расчёта минимального коэффициента
+BANK_FRACTION_PER_BET = 0.05   # f: доля банка на одну ставку (5%)
+BETS_PER_DAY = 3               # n: число ставок в день (можешь поменять)
+TARGET_DAILY_PROFIT = 0.02     # D: желаемая прибыль в день (2% от банка)
 
 # ===== 2. Работа с локальным состоянием (state.json) =====
 
@@ -502,6 +505,36 @@ def compute_win_chance_from_winrate_only(state: dict, authors: list[str]) -> flo
     chance = prod_p / denom
     return chance * 100.0
 
+def compute_min_odds_for_target_profit(win_chance_percent: float) -> float | None:
+    """
+    Считает минимальный средний коэффициент k по формуле:
+      1) t = D / (f * n)
+      2) k = 1 + (t + (1 - p)) / p
+
+    p — вероятность выигрыша (0..1), win_chance_percent — в процентах (0..100).
+    Возвращает k или None, если p некорректна.
+    """
+    if not isinstance(win_chance_percent, (int, float)):
+        return None
+
+    p = float(win_chance_percent) / 100.0
+    if p <= 0.0 or p >= 1.0:
+        return None
+
+    f = BANK_FRACTION_PER_BET
+    n = BETS_PER_DAY
+    D = TARGET_DAILY_PROFIT
+
+    if f <= 0.0 or n <= 0 or D <= 0.0:
+        return None
+
+    # Шаг 1: средняя прибыль с одной ставки в долях банка
+    t = D / (f * n)
+
+    # Шаг 2: минимальный коэффициент
+    k = 1.0 + (t + (1.0 - p)) / p
+    return k
+
 def update_upcoming_matches(state: dict, tips: list[dict]) -> None:
     """
     Обновляет state["upcoming_matches"] по новым прогнозам.
@@ -789,6 +822,11 @@ def process_upcoming_matches(state: dict) -> None:
 
         # Шанс по чистому winrate (основной)
         lines.append(f"Шанс по winrate: {chance_pure:.1f}%")
+        
+        # Минимальный средний коэффициент для достижения целевой дневной прибыли
+        k_min = compute_min_odds_for_target_profit(chance_pure)
+        if isinstance(k_min, (int, float)):
+            lines.append(f"Мин. кэф для {int(TARGET_DAILY_PROFIT * 100)}% в день: {k_min:.2f}")
 
         lines.append("-" * 40)
 
