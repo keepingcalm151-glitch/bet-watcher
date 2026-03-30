@@ -22,7 +22,6 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 import time
 import re
-import math
 
 # Часовые пояса
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
@@ -263,6 +262,22 @@ def parse_bettingexpert_tips(html: str, profile_name: str, profile_url: str) -> 
         if not selection_span:
             continue
         selection = selection_span.get_text(strip=True)
+        
+        # Период / тайм (если есть в описании ставки)
+        period = None
+        sel_lower = selection.lower()
+        if "1st half" in sel_lower or "first half" in sel_lower:
+            period = "1 тайм"
+        elif "2nd half" in sel_lower or "second half" in sel_lower:
+            period = "2 тайм"
+        elif "1st quarter" in sel_lower or "first quarter" in sel_lower:
+            period = "1 четверть"
+        elif "2nd quarter" in sel_lower or "second quarter" in sel_lower:
+            period = "2 четверть"
+        elif "3rd quarter" in sel_lower or "third quarter" in sel_lower:
+            period = "3 четверть"
+        elif "4th quarter" in sel_lower or "fourth quarter" in sel_lower:
+            period = "4 четверть"
 
         # odds – из блока с текстом "odds ... 1.93"
         odds_span = block.find(
@@ -312,6 +327,7 @@ def parse_bettingexpert_tips(html: str, profile_name: str, profile_url: str) -> 
                 "away_team": away_team,
                 "sport": sport,
                 "selection": selection,
+                "period": period, 
                 "odds": odds,
                 "author": author,
                 "tip_url": tip_url,
@@ -518,105 +534,6 @@ def compute_win_chance_after_losses(state: dict, authors: list[str]) -> float | 
     chance = prod_p / denom
     return chance * 100.0
 
-def compute_win_chance_dirty_authors(state: dict, authors: list[str]) -> tuple[float | None, list[dict]]:
-    """
-    Вероятность ставки по авторам с неполной историей ("грязные" авторы):
-    теперь считаем грязный win rate по их реальным ставкам:
-      - won = победа,
-      - lost + подвешенные = поражение,
-      - void игнорируется.
-
-    Возвращает (chance_percent, pending_matches), где:
-      - chance_percent: float или None,
-      - pending_matches: список словарей вида:
-          {
-            "author": ...,
-            "match": ...,
-            "selection": ...,
-            "kickoff": ...
-          }
-    """
-    author_stats = state.get("author_stats") or {}
-    ps: list[float] = []
-    pending_matches: list[dict] = []
-
-    for author in authors:
-        stats = author_stats.get(author)
-        if not stats:
-            continue
-
-        # интересуют только грязные авторы (есть подвешенные)
-        if author_ready_for_calc(state, author):
-            continue
-
-        # 1) считаем грязный win rate по всем ставкам автора
-        dirty_wr = compute_dirty_winrate_for_author(state, author)
-        if dirty_wr is None:
-            continue
-
-        p = max(0.0, min(1.0, float(dirty_wr) / 100.0))
-        ps.append(p)
-
-        # 2) Добавляем подвешенные матчи этого автора – для вывода в телегу
-        for m in get_author_pending_matches(state, author):
-            pending_matches.append(
-                {
-                    "author": author,
-                    "match": m.get("match"),
-                    "selection": m.get("selection"),
-                    "kickoff": m.get("kickoff"),
-                }
-            )
-
-    if not ps:
-        return None, pending_matches
-
-    prod_p = 1.0
-    prod_not = 1.0
-    for p in ps:
-        prod_p *= p
-        prod_not *= (1.0 - p)
-
-    denom = prod_p + prod_not
-    if denom <= 0.0:
-        return None, pending_matches
-
-    chance = prod_p / denom
-    return chance * 100.0, pending_matches
-    
-def compute_win_chance_for_authors(state: dict, authors: list[str]) -> float | None:
-    """
-    Чистый шанс выигрыша ставки:
-      - только по авторам с полной историей (author_ready_for_calc == True),
-      - с учётом серий неудач и формулы 95%,
-      - комбинирование по формуле P = (∏ p_i) / (∏ p_i + ∏ (1 - p_i)).
-
-    Возвращает шанс в процентах (0..100) или None.
-    """
-    ps: list[float] = []
-
-    for author in authors:
-        p_eff = compute_effective_author_prob(state, author)
-        if isinstance(p_eff, (int, float)):
-            p_eff = max(0.0, min(1.0, float(p_eff)))
-            ps.append(p_eff)
-
-    if not ps:
-        return None
-
-    prod_p = 1.0
-    prod_not = 1.0
-    for p in ps:
-        prod_p *= p
-        prod_not *= (1.0 - p)
-
-    denom = prod_p + prod_not
-    if denom <= 0.0:
-        return None
-
-    chance = prod_p / denom
-    return chance * 100.0
-
 def update_upcoming_matches(state: dict, tips: list[dict]) -> None:
     """
     Обновляет state["upcoming_matches"] по новым прогнозам.
@@ -635,6 +552,7 @@ def update_upcoming_matches(state: dict, tips: list[dict]) -> None:
         author = tip.get("author")
         kickoff = tip.get("kickoff_time_utc")
         odds = tip.get("odds")
+        period = tip.get("period")  # <-- вот ЗДЕСЬ добавляем
 
         if not match or not selection or not author or not kickoff:
             continue
@@ -658,6 +576,7 @@ def update_upcoming_matches(state: dict, tips: list[dict]) -> None:
             upcoming[key] = {
                 "match": match,
                 "selection": selection,
+                "period": period,   # <-- и вот здесь сохраняем период
                 "kickoff": kickoff,   # ISO‑строка в UTC
                 "authors": [],
                 "odds_list": [],
@@ -731,159 +650,6 @@ def update_author_bets(state: dict, tips: list[dict]) -> None:
         }
 # ===== 8. Обработка отложенных матчей и отправка уведомлений =====
 
-def author_ready_for_calc(state: dict, author: str) -> bool:
-    """
-    Автор допускается к расчёту шанса только если
-    все его ставки с kickoff <= сейчас уже имеют результат (result не None).
-
-    Если есть хотя бы одна прошедшая по времени ставка без result,
-    возвращаем False.
-    """
-    bets_by_author = state.get("bets_by_author") or {}
-    author_bets = bets_by_author.get(author) or {}
-    if not author_bets:
-        # нет истории — считаем, что нельзя оценивать
-        return False
-
-    now_utc = datetime.now(timezone.utc)
-
-    for bet in author_bets.values():
-        kickoff_str = bet.get("kickoff")
-        if not kickoff_str:
-            # без времени матча — тоже считаем, что не всё понятно
-            return False
-
-        try:
-            kickoff_dt = datetime.fromisoformat(kickoff_str)
-        except Exception:
-            return False
-
-        if kickoff_dt.tzinfo is None:
-            kickoff_dt = kickoff_dt.replace(tzinfo=timezone.utc)
-
-        # если матч уже должен был начаться / закончиться
-        if kickoff_dt <= now_utc:
-            # и при этом нет result — значит, есть незаконченная по данным ставка
-            if bet.get("result") is None:
-                return False
-
-    return True
-
-def get_author_pending_matches(state: dict, author: str) -> list[dict]:
-    """
-    Возвращает список "подвешенных" матчей автора:
-      - у ставки есть kickoff <= сейчас,
-      - но result == None.
-    Каждый элемент: {"match": ..., "selection": ..., "kickoff": ...}
-    """
-    bets_by_author = state.get("bets_by_author") or {}
-    author_bets = bets_by_author.get(author) or {}
-    pending: list[dict] = []
-
-    if not author_bets:
-        return pending
-
-    now_utc = datetime.now(timezone.utc)
-
-    for bet in author_bets.values():
-        kickoff_str = bet.get("kickoff")
-        if not kickoff_str:
-            # без времени матча считаем тоже "подвешенным"
-            pending.append(
-                {
-                    "match": bet.get("match"),
-                    "selection": bet.get("selection"),
-                    "kickoff": None,
-                }
-            )
-            continue
-
-        try:
-            kickoff_dt = datetime.fromisoformat(kickoff_str)
-        except Exception:
-            pending.append(
-                {
-                    "match": bet.get("match"),
-                    "selection": bet.get("selection"),
-                    "kickoff": kickoff_str,
-                }
-            )
-            continue
-
-        if kickoff_dt.tzinfo is None:
-            kickoff_dt = kickoff_dt.replace(tzinfo=timezone.utc)
-
-        # матч уже должен был начаться / закончиться
-        if kickoff_dt <= now_utc and bet.get("result") is None:
-            pending.append(
-                {
-                    "match": bet.get("match"),
-                    "selection": bet.get("selection"),
-                    "kickoff": kickoff_str,
-                }
-            )
-
-    return pending
-
-def compute_dirty_winrate_for_author(state: dict, author: str) -> float | None:
-    """
-    Считает "грязный" win rate автора:
-      - won считается как победа,
-      - lost и любые другие статусы (кроме void) считаются поражением,
-      - void/returned/refunded/push игнорируются,
-      - ВСЕ подвешенные ставки (kickoff <= сейчас и result is None)
-        считаются проигрышем.
-
-    Возвращает процент (0..100) или None, если нет данных.
-    """
-    bets_by_author = state.get("bets_by_author") or {}
-    author_bets = author_bets = bets_by_author.get(author) or {}
-    if not author_bets:
-        return None
-
-    now_utc = datetime.now(timezone.utc)
-
-    wins = 0
-    total = 0
-
-    for bet in author_bets.values():
-        res = (bet.get("result") or "").lower()
-        kickoff_str = bet.get("kickoff")
-
-        # void и аналоги – пропускаем
-        if res in ("void", "returned", "refunded", "push"):
-            continue
-
-        # Определяем, подвешенная ли ставка (kickoff уже был, но result == None)
-        is_pending_loss = False
-        if not res:  # result пустой или None
-            if kickoff_str:
-                try:
-                    kickoff_dt = datetime.fromisoformat(kickoff_str)
-                    if kickoff_dt.tzinfo is None:
-                        kickoff_dt = kickoff_dt.replace(tzinfo=timezone.utc)
-                except Exception:
-                    kickoff_dt = None
-            else:
-                kickoff_dt = None
-
-            if kickoff_dt is not None and kickoff_dt <= now_utc:
-                # матч уже должен был сыграться, но результат не известен — считаем проигрышем
-                is_pending_loss = True
-
-        # Классифицируем исход
-        if res == "won":
-            wins += 1
-            total += 1
-        elif is_pending_loss or res not in ("", None):
-            # всё, что НЕ won и не void, включая подвешенные, считаем поражением
-            total += 1
-
-    if total == 0:
-        return None
-
-    return (wins / total) * 100.0
-
 def get_author_loss_streak(state: dict, author: str) -> int:
     """
     Возвращает длину текущей серии неудач автора:
@@ -932,55 +698,6 @@ def get_author_loss_streak(state: dict, author: str) -> int:
 
     return streak
     
-def compute_effective_author_prob(state: dict, author: str) -> float | None:
-    """
-    Считает эффективную вероятность выигрыша для автора с учётом:
-      - базового win rate (как на сайте),
-      - серии прошлых неудач,
-      - целевой уверенности 95% по формуле:
-          1 - (1 - p)^n >= 0.95.
-
-    ВАЖНО: теперь считаем p_eff даже если у автора есть "подвешенные"
-    матчи (author_ready_for_calc может быть False) — достаточно того,
-    что у автора есть win rate.
-    """
-    author_stats = state.get("author_stats") or {}
-    stats = author_stats.get(author)
-    if not stats:
-        return None
-
-    wr = stats.get("win_rate_percent")
-    if not isinstance(wr, (int, float)):
-        return None
-
-    # базовая вероятность из винрейта
-    p = float(wr) / 100.0
-    p = max(0.0, min(1.0, p))
-
-    if p <= 0.0:
-        return 0.0
-    if p >= 1.0:
-        return 1.0
-
-    # серия неудач считаем как раньше
-    streak = get_author_loss_streak(state, author)
-
-    if streak <= 0:
-        return p
-
-    target = 0.95
-    try:
-        n95 = math.ceil(math.log(1.0 - target) / math.log(1.0 - p))
-    except (ValueError, ZeroDivisionError):
-        return p
-
-    m = min(streak + 1, n95)
-
-    p_eff = 1.0 - (1.0 - p) ** m
-    p_eff = max(0.0, min(1.0, p_eff))
-
-    return p_eff
-
 def update_author_stats(state: dict, author: str, win_rate: float | None) -> None:
     """
     Обновляет state["author_stats"] для конкретного автора.
@@ -1032,6 +749,7 @@ def process_upcoming_matches(state: dict) -> None:
         kickoff_str = info.get("kickoff")
         authors = info.get("authors") or []
         odds_list = info.get("odds_list") or []
+        period = info.get("period")  # может быть None
         # Чистый winrate (единственный обязательный шанс)
         chance_pure = info.get("win_chance_pure_percent")
         # Шанс после прошлых поражений (опционально)
@@ -1081,7 +799,18 @@ def process_upcoming_matches(state: dict) -> None:
         # Короткая запись выборa (П1, Ф1, ТБ и т.п.)
         short_sel = short_selection(selection, match)
 
-        authors_lines = [f"{author} — {short_sel}" for author in unique_authors]
+        # Если период/тайм известен — добавляем его в скобках
+        if period:
+            authors_lines = [
+                f"{author} — {short_sel} ({period})"
+                for author in unique_authors
+            ]
+        else:
+            authors_lines = [
+                f"{author} — {short_sel}"
+                for author in unique_authors
+            ]
+
         authors_block = "\n".join(authors_lines)
 
         # Формируем строки с шансами, если они посчитаны
