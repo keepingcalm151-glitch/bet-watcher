@@ -123,21 +123,44 @@ def send_telegram_message(text: str) -> None:
 
 def normalize_selection_for_grouping(selection: str) -> str:
     """
-    Нормализует ставку для группировки похожих исходов:
-    например, "Armenia U19 (-2) (EH)" и "Armenia U19 (-3) (EH)"
-    превратятся в один базовый ключ "Armenia U19 (EH)".
+    Нормализует ставку для группировки похожих исходов.
+
+    Цель:
+      - П1, П1(0), П1(+1), П1(-1), П1 +1.5 -> "П1"
+      - П2, П2(0), П2(+1), П2(-1)          -> "П2"
+      - ТБ 180.5, ТБ 176.5, ТБ 3.5         -> "ТБ"
+      - ТМ 180.5, ТМ 176.5, ТМ 3.5         -> "ТМ"
+      - EH-хендикап "<Team> (-3) (EH)"     -> "<Team> (EH)"
+    Всё остальное возвращаем как есть.
     """
     if not selection:
         return ""
     text = selection.strip()
 
-    # EH-хендикап: "<Team> (-3) (EH)" -> "<Team> (EH)"
-    m = re.match(r"(.+?)\s*\([+-]?\d+(\.\d+)?\)\s*\(EH\)", text)
-    if m:
-        team = m.group(1).strip()
+    # 1) EH-хендикап: "<Team> (-3) (EH)" -> "<Team> (EH)"
+    m_eh = re.match(r"(.+?)\s*\([+-]?\d+(\.\d+)?\)\s*\(EH\)", text)
+    if m_eh:
+        team = m_eh.group(1).strip()
         return f"{team} (EH)"
 
-    # иначе оставляем как есть
+    # 2) Чистые исходы П1/П2 с форой в скобках или без:
+    #    "П1", "П1(0)", "П1 (+1)", "П1 -1.5" -> "П1"
+    m_p = re.match(r"(П[12])\s*(\([^)]+\))?\s*([+-]?\d+(\.\d+)?)?", text, re.IGNORECASE)
+    if m_p:
+        base = m_p.group(1).upper()
+        return base
+
+    # 3) Тоталы: "ТБ 180.5", "ТБ180.5", "ТБ 3.5" -> "ТБ"
+    m_tb = re.match(r"(ТБ)\s*\d+([.,]\d+)?", text, re.IGNORECASE)
+    if m_tb:
+        return "ТБ"
+
+    # 4) Тоталы меньше: "ТМ 180.5", "ТМ180.5", "ТМ 3.5" -> "ТМ"
+    m_tm = re.match(r"(ТМ)\s*\d+([.,]\d+)?", text, re.IGNORECASE)
+    if m_tm:
+        return "ТМ"
+
+    # 5) Если ничего не распознали — возвращаем исходный текст
     return text
 
 def short_selection(selection: str, match: str | None = None) -> str:
