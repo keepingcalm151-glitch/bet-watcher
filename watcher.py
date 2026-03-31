@@ -757,8 +757,8 @@ def process_upcoming_matches(state: dict) -> None:
         # Чистый winrate (единственный обязательный шанс)
         chance_pure = info.get("win_chance_pure_percent")
 
-        # Если нет шанса по winrate или он < 60% — не шлём уведомление
-        if not isinstance(chance_pure, (int, float)) or chance_pure < 55.0:
+        # Если нет шанса по winrate или он < 70% — не шлём уведомление
+        if not isinstance(chance_pure, (int, float)) or chance_pure < 65.0:
             continue
 
 
@@ -789,7 +789,7 @@ def process_upcoming_matches(state: dict) -> None:
             continue
 
         unique_authors = sorted(set(authors))
-        if len(unique_authors) < 2:
+        if len(unique_authors) < 4:
             # Меньше двух разных авторов – пропускаем
             continue
 
@@ -845,6 +845,105 @@ def process_upcoming_matches(state: dict) -> None:
             print("[INFO] Уведомление по отложенным матчам отправлено.")
         except Exception as e:
             print(f"[ERROR] Не удалось отправить сообщение по отложенным матчам: {e}")
+
+def process_night_matches_summary(state: dict) -> None:
+    """
+    В 23:00 по МСК отправляет одно сообщение со всеми ночными матчами
+    (с 00:00 до 07:00 ближайшей ночи), где:
+      - минимум 4 разных автора на одном исходе,
+      - шанс по winrate >= 55%.
+    """
+    upcoming = state.get("upcoming_matches") or {}
+    if not upcoming:
+        return
+
+    now_msk = datetime.now(MOSCOW_TZ)
+    # шлём резюме только в 23-й час
+    if now_msk.hour != 23:
+        return
+
+    today_str = now_msk.strftime("%Y-%m-%d")
+    last_date = state.get("night_summary_date")
+    # уже слали сегодня – выходим
+    if last_date == today_str:
+        return
+
+    # ближайшая ночь: с полуночи до 07:00 следующего календарного дня по МСК
+    night_date = (now_msk + timedelta(days=1)).date()
+
+    parts: list[str] = []
+
+    for key, info in list(upcoming.items()):
+        match = info.get("match") or "матч неизвестен"
+        selection = info.get("selection") or "выбор не указан"
+        kickoff_str = info.get("kickoff")
+        authors = info.get("authors") or []
+        odds_list = info.get("odds_list") or []
+        period = info.get("period")
+        chance_pure = info.get("win_chance_pure_percent")
+
+        if not kickoff_str:
+            continue
+
+        # шанс по winrate
+        if not isinstance(chance_pure, (int, float)) or chance_pure < 55.0:
+            continue
+
+        # минимум 4 разных автора
+        unique_authors = sorted(set(authors))
+        if len(unique_authors) < 4:
+            continue
+
+        try:
+            kickoff_utc = datetime.fromisoformat(kickoff_str)
+        except Exception:
+            continue
+
+        if kickoff_utc.tzinfo is None:
+            kickoff_utc = kickoff_utc.replace(tzinfo=timezone.utc)
+
+        kickoff_msk = kickoff_utc.astimezone(MOSCOW_TZ)
+
+        # матч должен быть в ближайшую ночь: дата = night_date и время 00:00–06:59
+        if kickoff_msk.date() != night_date:
+            continue
+        if not (0 <= kickoff_msk.hour < 7):
+            continue
+
+        avg_odds = sum(odds_list) / len(odds_list) if odds_list else None
+        odds_str = f"{avg_odds:.2f}" if avg_odds is not None else "—"
+        kickoff_human = kickoff_msk.strftime("%Y-%m-%d %H:%M")
+
+        author_selections = info.get("author_selections") or {}
+        authors_lines = []
+        for author in unique_authors:
+            sel_for_author = author_selections.get(author, selection)
+            sel_short = short_selection(sel_for_author, match)
+            if period:
+                authors_lines.append(f"{author} — {sel_short} ({period})")
+            else:
+                authors_lines.append(f"{author} — {sel_short}")
+        authors_block = "\n".join(authors_lines)
+
+        lines = [
+            f"<b>Ночной матч:</b> {match}",
+            f"Время (МСК): {kickoff_human}",
+            authors_block,
+            f"Средний кэф: {odds_str}",
+            f"Шанс по winrate: {chance_pure:.1f}%",
+            "-" * 40,
+        ]
+        parts.append("\n".join(lines))
+
+    if parts:
+        full_message = "Ночные матчи (00:00–07:00 ближайшей ночи):\n\n" + "\n\n".join(parts)
+        try:
+            send_telegram_message(full_message)
+            state["night_summary_date"] = today_str  # отмечаем, что за сегодня уже слали
+            print("[INFO] Ночное резюме по матчам отправлено.")
+        except Exception as e:
+            print(f"[ERROR] Не удалось отправить ночное резюме: {e}")
+
 # ===== 9. Один проход по всем профилям bettingexpert =====
 
 def check_profiles_once() -> None:
@@ -926,11 +1025,15 @@ def check_profiles_once() -> None:
     # Обновляем память о будущих матчах (до 7 дней вперёд)
     update_upcoming_matches(state, all_enriched_tips)
 
-    # Проверяем, есть ли матчи, попадающие в окно -40..80 минут и >=2 авторов
+    # Проверяем, есть ли матчи, попадающие в окно -40..80 минут и >=4 авторов
     process_upcoming_matches(state)
+
+    # В 23:00 шлём ночное резюме (00:00–07:00 ближайшей ночи) при >=4 авторах
+    process_night_matches_summary(state)
 
     # Сохраняем состояние
     save_state(state)
+
 # ===== 10. Точка входа (главный цикл) =====
 
 if __name__ == "__main__":
