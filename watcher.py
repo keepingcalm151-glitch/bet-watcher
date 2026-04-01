@@ -761,10 +761,6 @@ def process_upcoming_matches(state: dict) -> None:
     if not upcoming:
         return
 
-    now_msk = datetime.now(MOSCOW_TZ)
-    max_before = timedelta(minutes=80)
-    max_after = timedelta(minutes=40)
-
     parts: list[str] = []
 
     for key, info in list(upcoming.items()):
@@ -781,7 +777,7 @@ def process_upcoming_matches(state: dict) -> None:
         chance_pure = info.get("win_chance_pure_percent")
 
         # Если нет шанса по winrate или он < 70% — не шлём уведомление
-        if not isinstance(chance_pure, (int, float)) or chance_pure < 65.0:
+        if not isinstance(chance_pure, (int, float)) or chance_pure < 70.0:
             continue
 
 
@@ -798,22 +794,9 @@ def process_upcoming_matches(state: dict) -> None:
 
         kickoff_msk = kickoff_utc.astimezone(MOSCOW_TZ)
 
-        # 1) матч должен быть в тот же календарный день по МСК
-        if kickoff_msk.date() != now_msk.date():
-            continue
-
-        # 2) дальше проверяем окно по времени
-        delta = kickoff_msk - now_msk
-        if not (-max_after <= delta <= max_before):
-            continue
-
-        # Условие "окна": от -40 до +80 минут относительно текущего времени
-        if not (-max_after <= delta <= max_before):
-            continue
-
         unique_authors = sorted(set(authors))
         if len(unique_authors) < 4:
-            # Меньше двух разных авторов – пропускаем
+            # Меньше четырех разных авторов – пропускаем
             continue
 
         avg_odds = sum(odds_list) / len(odds_list) if odds_list else None
