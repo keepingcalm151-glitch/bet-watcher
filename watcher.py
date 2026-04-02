@@ -776,7 +776,7 @@ def process_upcoming_matches(state: dict) -> None:
         chance_pure = info.get("win_chance_pure_percent")
 
         # Если нет шанса по winrate или он < 70% — не шлём уведомление
-        if not isinstance(chance_pure, (int, float)) or chance_pure < 70.0:
+        if not isinstance(chance_pure, (int, float)) or chance_pure < 80.0:
             continue
 
 
@@ -794,7 +794,7 @@ def process_upcoming_matches(state: dict) -> None:
         kickoff_msk = kickoff_utc.astimezone(MOSCOW_TZ)
 
         unique_authors = sorted(set(authors))
-        if len(unique_authors) < 4:
+        if len(unique_authors) < 2:
             # Меньше четырех разных авторов – пропускаем
             continue
 
