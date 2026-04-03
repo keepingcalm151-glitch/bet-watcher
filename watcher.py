@@ -376,7 +376,6 @@ def parse_match_tips(html: str, match_url: str, match_title: str) -> List[TipOnM
         class_=lambda x: x
         and "font-gc" in x.split()
         and "font-bold" in x.split()
-        and "h-[48px]" in x.split()
     )
 
     # Попробуем заранее выдрать коэффициенты, если есть.
@@ -607,12 +606,12 @@ def safe_parse_today_matches(html: str) -> List[Tuple[str, str, str]]:
         return []
 
 
-def safe_parse_match_tips(html: str, match_url: str, match_title: str) -> List[TipOnMatch]:
+def safe_parse_today_matches(html: str) -> List[Tuple[str, str, str]]:
     try:
-        tips = parse_match_tips(html, match_url, match_title)
-        return tips
+        matches = parse_today_matches(html)
+        return matches
     except Exception as e:
-        print(f"[ERROR] Ошибка парсинга tip'ов для матча {match_url}: {e}")
+        print(f"[ERROR] Ошибка парсинга списка матчей: {e}")
         return []
 
 
@@ -660,6 +659,7 @@ def collect_today_tips_with_winrates(state: dict) -> List[TipOnMatch]:
             continue
 
         tips = safe_parse_match_tips(match_html, rel_url, match_title)
+        print(f"[DEBUG] Для матча {match_title} нашли tip'ов: {len(tips)}")
         if not tips:
             continue
 
