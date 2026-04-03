@@ -308,32 +308,51 @@ def parse_kickoff_datetime_today(kickoff_time_str: str) -> Optional[datetime]:
 def parse_match_tips(html: str, match_url: str, match_title: str) -> List[TipOnMatch]:
     """
     Парсим страницу конкретного матча /football/...
-    Возвращаем список TipOnMatch.
+
+    Стратегия (более универсальная под новую вёрстку):
+      - ищем все ссылки /user/profile/<slug> (это типстеры)
+      - от каждого профиля поднимаемся вверх до контейнера tip'а
+      - в контейнере ищем "selection" (текст ставки) и, по возможности, odds
     """
     soup = BeautifulSoup(html, "html.parser")
     tips: List[TipOnMatch] = []
 
-    selection_divs = soup.find_all(
-        "div",
-        class_=lambda x: x
-        and "font-gc" in x.split()
-        and "font-bold" in x.split()
-    )
+    # Все ссылки на профили типстеров
+    profile_links = soup.find_all("a", href=re.compile(r"/user/profile/[^/?#]+"))
 
-    def extract_nearby_odds(block: BeautifulSoup) -> Optional[float]:
-        parent = block.parent
-        if not parent:
-            return None
-        text = parent.get_text(" ", strip=True)
-        text = text.replace(",", ".")
+    def extract_selection(container) -> Optional[str]:
+        # Ищем крупный текст ставки в div/span, который:
+        # - не содержит "odds", "win rate", "by", "hour ago" и т.п.
+        # - не слишком короткий
+        for tag in container.find_all(["div", "span"], string=True):
+            txt = tag.get_text(" ", strip=True)
+            low = txt.lower()
+            if not txt:
+                continue
+            if len(txt) < 4:
+                continue
+            if "odds" in low:
+                continue
+            if "win rate" in low:
+                continue
+            if "hour ago" in low or "hours ago" in low or "minutes ago" in low:
+                continue
+            if "by " in low:  # "3 hours ago by"
+                continue
+            return txt
+        return None
+
+    def extract_nearby_odds(container) -> Optional[float]:
+        # Ищем текст "odds 1.95" или просто число после слова odds в пределах контейнера
+        text = container.get_text(" ", strip=True).replace(",", ".")
         m = re.search(r"odds\s+(\d+(?:\.\d+)?)", text, flags=re.IGNORECASE)
         if m:
             try:
                 return float(m.group(1))
             except ValueError:
                 return None
-        tokens = text.split()
-        for tok in reversed(tokens):
+        # fallback — любое правдоподобное число
+        for tok in reversed(text.split()):
             try:
                 val = float(tok)
                 if 1.01 <= val <= 100.0:
@@ -342,57 +361,27 @@ def parse_match_tips(html: str, match_url: str, match_title: str) -> List[TipOnM
                 continue
         return None
 
-    for sel_div in selection_divs:
-        selection_raw = sel_div.get_text(strip=True)
-        if not selection_raw:
+    for a in profile_links:
+        href = a.get("href", "")
+        m_slug = re.search(r"/user/profile/([^/?#]+)", href)
+        if not m_slug:
             continue
+        author_slug = m_slug.group(1)
+        author_name = a.get_text(strip=True) or author_slug
 
-        author_name = None
-        author_slug = None
-
-        container = sel_div
+        # Поднимаемся вверх, чтобы захватить весь блок tip'а
+        container = a
         for _ in range(5):
             if container.parent is None:
                 break
             container = container.parent
 
-        by_label = None
-        for small in container.find_all("div"):
-            txt = small.get_text(" ", strip=True).lower()
-            if " by" in txt and ("hour" in txt or "minute" in txt or "day" in txt):
-                by_label = small
-                break
-
-        if by_label:
-            author_block = by_label.find_next(
-                "div",
-                class_=lambda x: x
-                and "flex" in x.split()
-                and "items-center" in x.split()
-                and "text-red-felix" in x
-            )
-        else:
-            author_block = None
-
-        if author_block:
-            name_div = author_block.find(
-                "div",
-                class_=lambda x: x and "mr-1" in x.split()
-            )
-            if name_div:
-                author_name = name_div.get_text(strip=True)
-
-            a_profile = author_block.find("a", href=True)
-            if a_profile:
-                href = a_profile["href"]
-                m_slug = re.search(r"/user/profile/([^/?#]+)", href)
-                if m_slug:
-                    author_slug = m_slug.group(1)
-
-        if not author_name or not author_slug:
+        selection_raw = extract_selection(container)
+        if not selection_raw:
+            # если не нашли нормальный текст ставки, пропускаем
             continue
 
-        odds = extract_nearby_odds(sel_div)
+        odds = extract_nearby_odds(container)
         group_key = normalize_selection_for_grouping(selection_raw)
 
         tip = TipOnMatch(
