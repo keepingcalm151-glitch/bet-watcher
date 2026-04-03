@@ -1,75 +1,72 @@
 # watcher.py
 #
-# Основной воркер для Railway:
+# Новый воркер для Railway:
 #   Procfile: worker: python watcher.py
-# Использует:
-#   - requests
-#   - beautifulsoup4
 #
-# Логика:
-#   - берём профили tipster'ов на bettingexpert из config["sites"]
-#   - парсим активные ставки
-#   - по каждой ставке заходим на страницу tip'а и парсим время матча
-#   - запоминаем матчи до 7 дней вперёд
-#     шлём уведомление в Telegram
+# Логика (новая):
+#   - заходим на страницу с сегодняшними футбольными матчами (today_football_url)
+#   - вытаскиваем все ссылки вида /football/...
+#   - для каждой ссылки:
+#       - открываем страницу матча
+#       - парсим все ставки (selection) и авторов
+#       - для каждого автора заходим на профиль /user/profile/<slug> и берём Win rate
+#   - группируем авторов по одинаковым/похожим ставкам
+#   - считаем комбинированный шанс выигрыша:
+#       P = 1 - Π(1 - p_i), где p_i = winrate_i / 100
+#   - если P * 100 > winrate_threshold_percent и авторов >= min_authors_per_signal,
+#       шлём сигнал в Telegram:
+#         - матч
+#         - время матча
+#         - список ставок (без имён авторов)
+#         - процент победы
 
 import json
 import os
-import requests
-from bs4 import BeautifulSoup
-from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 import time
 import re
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional, Tuple
+
+import requests
+from bs4 import BeautifulSoup
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 # Часовые пояса
-MOSCOW_TZ = ZoneInfo("Europe/Moscow")
-BETTINGEXPERT_TZ = ZoneInfo("Europe/Copenhagen")  # время на сайте bettingexpert
-
-# Для парсинга дат вида "2 Apr 10:35"
-MONTHS_EN = {
-    "jan": 1, "january": 1,
-    "feb": 2, "february": 2,
-    "mar": 3, "march": 3,
-    "apr": 4, "april": 4,
-    "may": 5,
-    "jun": 6, "june": 6,
-    "jul": 7, "july": 7,
-    "aug": 8, "august": 8,
-    "sep": 9, "sept": 9, "september": 9,
-    "oct": 10, "october": 10,
-    "nov": 11, "november": 11,
-    "dec": 12, "december": 12,
-}
+BETTINGEXPERT_TZ = ZoneInfo("Europe/Copenhagen")
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")  # для удобства отображения времени
 
 CONFIG_PATH = "config.json"
 STATE_PATH = "state.json"
+
 # ===== 1. Загрузка конфигурации =====
 
 if os.getenv("CONFIG_JSON"):
-    # В проде (Railway) можно положить весь config.json в переменную среды
     config = json.loads(os.getenv("CONFIG_JSON"))
 else:
-    # Локально берём из файла config.json
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         config = json.load(f)
 
-OPENAI_API_KEY = config.get("openai_api_key")       # сейчас не используем, но оставляем
-TELEGRAM_BOT_TOKEN = config["telegram_bot_token"]
-TELEGRAM_CHAT_ID = config["telegram_chat_id"]
-THESPORTSDB_KEY = config.get("thesportsdb_key")     # опционально, оставим на будущее
-SITES = config["sites"]                             # профили bettingexpert
-CHECK_INTERVAL_MINUTES = config.get("check_interval_minutes", 15)
-# Параметры банка для расчёта минимального коэффициента
-BANK_FRACTION_PER_BET = 0.05   # f: доля банка на одну ставку (5%)
-BETS_PER_DAY = 3               # n: число ставок в день (можешь поменять)
-TARGET_DAILY_PROFIT = 0.02     # D: желаемая прибыль в день (2% от банка)
+TELEGRAM_BOT_TOKEN: str = config["telegram_bot_token"]
+TELEGRAM_CHAT_ID: str = config["telegram_chat_id"]
+CHECK_INTERVAL_MINUTES: int = config.get("check_interval_minutes", 15)
+
+BASE_URL: str = config.get("base_url", "https://www.bettingexpert.com").rstrip("/")
+TODAY_FOOTBALL_URL: str = config.get(
+    "today_football_url",
+    f"{BASE_URL}/football"
+)
+
+WINRATE_THRESHOLD_PERCENT: float = float(config.get("winrate_threshold_percent", 98.0))
+MIN_AUTHORS_PER_SIGNAL: int = int(config.get("min_authors_per_signal", 2))
+MIN_TIPS_PER_MATCH: int = int(config.get("min_tips_per_match", 1))
+MAX_SIGNALS_PER_DAY: int = int(config.get("max_signals_per_day", 20))
 
 # ===== 2. Работа с локальным состоянием (state.json) =====
 
 def load_state() -> dict:
     """
-    Загружаем state.json (память о матчах / уведомлениях).
+    Загружаем state.json (память о уже отправленных сигналах и кэше winrate).
     Если файла нет или он битый – возвращаем пустой dict.
     """
     if not os.path.exists(STATE_PATH):
@@ -87,310 +84,430 @@ def save_state(state: dict) -> None:
     """
     with open(STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
-# ===== 3. Утилиты сети и Telegram =====
 
-def fetch_page(url: str) -> str:
-    """
-    Скачиваем HTML страницы с нормальным User-Agent'ом.
-    """
-    headers = {
+
+# ===== 3. HTTP-утилита и Telegram =====
+
+SESSION = requests.Session()
+SESSION.headers.update(
+    {
         "User-Agent": (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/122.0 Safari/537.36"
         )
     }
-    resp = requests.get(url, headers=headers, timeout=30)
+)
+
+
+def fetch_page(url: str) -> str:
+    """
+    Скачиваем HTML страницы с нормальным User-Agent'ом.
+    Бросает исключение, если не получилось.
+    """
+    # если передан относительный путь типа "/football/...", добавим BASE_URL
+    if url.startswith("/"):
+        full_url = BASE_URL + url
+    else:
+        full_url = url
+
+    resp = SESSION.get(full_url, timeout=30)
     resp.raise_for_status()
     return resp.text
 
 
 def send_telegram_message(text: str) -> None:
     """
-    Отправка сообщения в Telegram (в твой чат).
+    Отправка сообщения в Telegram в указанный чат.
     """
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
         "parse_mode": "HTML",
+        "disable_web_page_preview": True,
     }
     resp = requests.post(url, json=payload, timeout=30)
     resp.raise_for_status()
+# ===== 4. Структуры данных =====
 
-# ===== 4. Короткая запись ставки (П1, П2, Ф1, ТБ и т.д.) =====
+@dataclass
+class AuthorInfo:
+    slug: str                     # профайл-слуг на сайте (nieder, Dyole, ...)
+    name: str                     # отображаемое имя
+    winrate_percent: Optional[float] = None  # Win rate, например 47.94
+    winrate_updated_at: Optional[float] = None  # timestamp, когда обновили
+
+
+@dataclass
+class TipOnMatch:
+    match_url: str                # относительный путь /football/...
+    match_title: str              # "NK Krka - ND Triglav"
+    kickoff_utc: Optional[datetime]  # время матча (UTC, если удастся достать)
+    selection_raw: str            # исход как на странице ("NK Krka +0.75 (AH)")
+    selection_group_key: str      # нормализованный ключ для группировки
+    author_slug: str
+    author_name: str
+    author_winrate: Optional[float]
+    odds: Optional[float]
+
+
+@dataclass
+class Signal:
+    match_url: str
+    match_title: str
+    kickoff_utc: Optional[datetime]
+    kickoff_moscow: Optional[datetime]
+    selection_group_key: str
+    selections_raw: List[str] = field(default_factory=list)
+    authors: List[str] = field(default_factory=list)
+    combined_win_chance_percent: float = 0.0
+
+
+# ===== 5. Вероятности и нормализация исходов =====
+
+def combine_independent_probabilities(ps: List[float]) -> float:
+    """
+    Комбинируем независимые вероятности p1, p2, ... по формуле:
+      P = 1 - (1 - p1) * (1 - p2) * ...
+    Аргумент ps — числа в диапазоне [0,1].
+    Возвращаем P (тоже [0,1]).
+    """
+    if not ps:
+        return 0.0
+    prod_not = 1.0
+    for p in ps:
+        p_clamped = max(0.0, min(1.0, float(p)))
+        prod_not *= (1.0 - p_clamped)
+    P = 1.0 - prod_not
+    return max(0.0, min(1.0, P))
+
 
 def normalize_selection_for_grouping(selection: str) -> str:
     """
-    Нормализует ставку для группировки похожих исходов.
-
-    Цель:
-      - П1, П1(0), П1(+1), П1(-1), П1 +1.5 -> "П1"
-      - П2, П2(0), П2(+1), П2(-1)          -> "П2"
-      - ТБ 180.5, ТБ 176.5, ТБ 3.5         -> "ТБ"
-      - ТМ 180.5, ТМ 176.5, ТМ 3.5         -> "ТМ"
-      - EH-хендикап "<Team> (-3) (EH)"     -> "<Team> (EH)"
-    Всё остальное возвращаем как есть.
-    """
-    if not selection:
-        return ""
-    text = selection.strip()
-
-    # 1) EH-хендикап: "<Team> (-3) (EH)" -> "<Team> (EH)"
-    m_eh = re.match(r"(.+?)\s*\([+-]?\d+(\.\d+)?\)\s*\(EH\)", text)
-    if m_eh:
-        team = m_eh.group(1).strip()
-        return f"{team} (EH)"
-
-    # 2) Чистые исходы П1/П2 с форой в скобках или без:
-    #    "П1", "П1(0)", "П1 (+1)", "П1 -1.5" -> "П1"
-    m_p = re.match(r"(П[12])\s*(\([^)]+\))?\s*([+-]?\d+(\.\d+)?)?", text, re.IGNORECASE)
-    if m_p:
-        base = m_p.group(1).upper()
-        return base
-
-    # 3) Тоталы: "ТБ 180.5", "ТБ180.5", "ТБ 3.5" -> "ТБ"
-    m_tb = re.match(r"(ТБ)\s*\d+([.,]\d+)?", text, re.IGNORECASE)
-    if m_tb:
-        return "ТБ"
-
-    # 4) Тоталы меньше: "ТМ 180.5", "ТМ180.5", "ТМ 3.5" -> "ТМ"
-    m_tm = re.match(r"(ТМ)\s*\d+([.,]\d+)?", text, re.IGNORECASE)
-    if m_tm:
-        return "ТМ"
-
-    # 5) Если ничего не распознали — возвращаем исходный текст
-    return text
-
-def short_selection(selection: str, match: str | None = None) -> str:
-    """
-    Делает короткую запись ставки из длинного текста selection.
-    Умеет:
-      - "Over 167.5 points" -> "ТБ 167.5"
-      - "Under 16.5 games" -> "ТМ 16.5"
-      - "<Team> to win  Draw No Bet" -> "ДНБ <Team>"
-      - "<Team> to win" -> "П1"/"П2" (если можем сопоставить с хозяевами/гостями)
-      - "<Team> -1.00 (AH)" -> "Ф1(-1.0)" / "Ф2(-1.0)"
-      - "+0.50 (AH)" -> "AH +0.50"
-    Если не распознали — возвращаем исходный selection.
+    Нормализует исход ставки для группировки похожих:
+      - "NK Krka +0.75 (AH)" -> "NK Krka (AH)" (срезаем числовой хендикап)
+      - "Over 3.5 goals" -> "Over goals"
+      - "Under 2.25 goals" -> "Under goals"
+      - "Gaziantep FK to win  Draw No Bet" -> "Gaziantep FK DNB"
+      - "Team -1.00 (AH)" -> "Team (AH)"
+      - "+0.50 (AH)" (без команды) -> "+(AH)" (отдельная группа)
+    Нужно, чтобы разные авторы с чуть разными линиями,
+    но тем же направлением, группировались вместе.
     """
     if not selection:
         return ""
 
     text = selection.strip()
+    lower = text.lower()
 
-    home_team = away_team = None
-    if match and " vs " in match:
-        home_team, away_team = [p.strip() for p in match.split(" vs ", 1)]
+    # Draw No Bet + команда в начале
+    m_dnb = re.match(r"(.+?)\s+to\s+win\s+draw\s+no\s+bet", lower)
+    if m_dnb:
+        team = m_dnb.group(1).strip()
+        return f"{team} DNB"
 
-    # Over / Under тотал
-    m_over = re.search(r"\bOver\s+(\d+(\.\d+)?)", text, re.IGNORECASE)
+    # Over / Under goals
+    m_over = re.match(r"\s*over\s+[\d.,]+\s+goals?", lower)
     if m_over:
-        val = m_over.group(1).replace(",", ".")
-        return f"ТБ {val}"
+        return "Over goals"
 
-    m_under = re.search(r"\bUnder\s+(\d+(\.\d+)?)", text, re.IGNORECASE)
+    m_under = re.match(r"\s*under\s+[\d.,]+\s+goals?", lower)
     if m_under:
-        val = m_under.group(1).replace(",", ".")
-        return f"ТМ {val}"
+        return "Under goals"
 
-    # Draw No Bet
-    if re.search(r"Draw\s+No\s+Bet", text, re.IGNORECASE):
-        m_team = re.match(r"(.+?)\s+to\s+win", text, re.IGNORECASE)
-        team = m_team.group(1).strip() if m_team else text.split("Draw")[0].strip()
-        return f"ДНБ {team}"
+    # Азиатский гандикап "Team +0.75 (AH)" -> "Team (AH)"
+    m_ah_team = re.match(r"(.+?)\s+[+-]?\d+(\.\d+)?\s*\(ah\)", text, flags=re.IGNORECASE)
+    if m_ah_team:
+        team = m_ah_team.group(1).strip()
+        return f"{team} (AH)"
 
-    # Победа "<Team> to win"
-    m_win = re.match(r"(.+?)\s+to\s+win\b", text, re.IGNORECASE)
+    # Азиатский гандикап без команды "+0.75 (AH)" -> "+(AH)"
+    m_ah = re.match(r"[+-]?\d+(\.\d+)?\s*\(ah\)", text, flags=re.IGNORECASE)
+    if m_ah:
+        return "+(AH)"
+
+    # Простое "Team to win"
+    m_win = re.match(r"(.+?)\s+to\s+win\b", text, flags=re.IGNORECASE)
     if m_win:
         team = m_win.group(1).strip()
-        if home_team and team.lower() in home_team.lower():
-            return "П1"
-        if away_team and team.lower() in away_team.lower():
-            return "П2"
-        return f"Победа {team}"
+        return f"{team} win"
 
-    # AH "<Team> +0.50 (AH)"
-    m_ah_full = re.match(r"(.+?)\s+([+-]?\d+(\.\d+)?)\s*\(AH\)", text, re.IGNORECASE)
-    if m_ah_full:
-        team = m_ah_full.group(1).strip()
-        val = m_ah_full.group(2).replace(",", ".")
-        if home_team and team.lower() in home_team.lower():
-            return f"Ф1({val})"
-        if away_team and team.lower() in away_team.lower():
-            return f"Ф2({val})"
-        return f"AH {val}"
+    # Тоталы без слова goals: "Over 167.5 points", "Over 2.5"
+    m_over_any = re.match(r"\s*over\s+[\d.,]+", lower)
+    if m_over_any:
+        return "Over"
 
-    # AH без команды "+0.50 (AH)"
-    m_ah = re.search(r"([+-]?\d+(\.\d+)?)\s*\(AH\)", text, re.IGNORECASE)
-    if m_ah:
-        val = m_ah.group(1).replace(",", ".")
-        return f"AH {val}"
+    m_under_any = re.match(r"\s*under\s+[\d.,]+", lower)
+    if m_under_any:
+        return "Under"
 
-    # Если ничего не распознали — возвращаем исходный текст
+    # Если ничего не распознали — возвращаем как есть (обрежем пробелы)
     return text
-# ===== 5. Парсинг активных ставок с профиля bettingexpert =====
+# ===== 6. Парсинг списка сегодняшних матчей (страница football) =====
 
-def parse_bettingexpert_tips(html: str, profile_name: str, profile_url: str) -> list[dict]:
+def parse_today_matches(html: str) -> List[Tuple[str, str, str]]:
     """
-    Парсер блока активных tips на bettingexpert‑профиле.
+    Парсим страницу с сегодняшними матчами (например /football).
 
-    Возвращает список словарей:
-    [
-      {
-        "match": "Macarthur FC vs Newcastle Jets",
-        "home_team": "Macarthur FC",
-        "away_team": "Newcastle Jets",
-        "sport": "football",
-        "selection": "Macarthur FC +0.50 (AH)",
-        "odds": 1.93,
-        "author": "Dyole",
-        "tip_url": "https://www.bettingexpert.com/football/macarthur-fc-vs-newcastle-jets",
-        "result": result,
-      },
-      ...
-    ]
+    Вёрстка типа:
+      <a class="flex ... " href="/football/lancaster-city-vs-morpeth-town-fc">
+        <div class="font-os text-lg uppercase mr-4">16:15</div>
+        <div class="flex flex-col ...">
+          <div class="font-ms truncate w-full">Lancaster City</div>
+          <div class="font-ms truncate w-full">Morpeth Town FC</div>
+        </div>
+      </a>
+
+    Возвращаем список кортежей:
+      (relative_url, match_title, kickoff_time_str)
+
+    Где:
+      relative_url: "/football/nd-triglav-vs-nk-krka"
+      match_title:  "NK Krka vs ND Triglav"
+      kickoff_time_str: "17:00" (как на странице)
     """
     soup = BeautifulSoup(html, "html.parser")
+    results: List[Tuple[str, str, str]] = []
 
-    tips: list[dict] = []
+    # Ищем все <a ... href="/football/...">
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if not href.startswith("/football/"):
+            continue
 
-    # Карточки tip'ов – div с классами cursor-pointer и bg-white и ссылкой внутри
-    tip_blocks = soup.find_all(
-        lambda tag: tag.name == "div"
-        and "cursor-pointer" in tag.get("class", [])
-        and "bg-white" in tag.get("class", [])
-        and tag.find("a", href=True)
+        # время матча, внутри <div class="font-os text-lg ...">
+        time_div = a.find(
+            "div",
+            class_=lambda x: x and "font-os" in x.split() and "text-lg" in x.split()
+        )
+        if not time_div:
+            continue
+        kickoff_str = time_div.get_text(strip=True)
+
+        # команды — два подряд <div class="font-ms truncate w-full">
+        team_divs = a.find_all(
+            "div",
+            class_=lambda x: x and "font-ms" in x.split() and "truncate" in x.split()
+        )
+        if len(team_divs) < 2:
+            continue
+
+        home_team = team_divs[0].get_text(strip=True)
+        away_team = team_divs[1].get_text(strip=True)
+        match_title = f"{home_team} vs {away_team}"
+
+        results.append((href, match_title, kickoff_str))
+
+    return results
+
+
+def parse_kickoff_datetime_today(kickoff_time_str: str) -> Optional[datetime]:
+    """
+    Превращаем строку времени вида "17:00" в datetime на СЕГОДНЯ в таймзоне BETTINGEXPERT_TZ.
+    Если формат странный — возвращаем None.
+
+    Важно: это "грубое" время, реальное время старта может быть в другом месте,
+    но для твоей задачи достаточно этого.
+    """
+    m = re.match(r"^\s*(\d{1,2}):(\d{2})\s*$", kickoff_time_str)
+    if not m:
+        return None
+
+    hour = int(m.group(1))
+    minute = int(m.group(2))
+
+    now = datetime.now(BETTINGEXPERT_TZ)
+    try:
+        dt = datetime(
+            year=now.year,
+            month=now.month,
+            day=now.day,
+            hour=hour,
+            minute=minute,
+            tzinfo=BETTINGEXPERT_TZ,
+        )
+    except ValueError:
+        return None
+
+    # Переводим в UTC, чтобы внутри всё сравнивать в UTC
+    return dt.astimezone(timezone.utc)
+# ===== 7. Парсинг страницы матча: ставки и авторы =====
+
+def parse_match_tips(html: str, match_url: str, match_title: str) -> List[TipOnMatch]:
+    """
+    Парсим страницу конкретного матча /football/...
+
+    Из HTML (пример с NK Krka +0.75 (AH)) нам нужны:
+      - selection_raw: текст исхода (например "NK Krka +0.75 (AH)")
+      - author_name:  "nieder"
+      - author_slug:  "nieder"  (из ссылки /user/profile/nieder)
+      - odds:         коэффициент, если рядом есть блок с odds (по возможности)
+
+    Типичная вёрстка куска tip'а (упрощённо):
+
+      <a href="football/nd-triglav-vs-nk-krka">NK Krka - ND Triglav</a>
+      ...
+      <div class="font-gc font-bold h-[48px] ... text-[22px]">
+         NK Krka +0.75 (AH)
+      </div>
+      ...
+      <div class="text-xs text-grey3 italic font-gc">
+         3 hours ago by
+      </div>
+      <div class="flex flex-row items-center text-red-felix text-xs font-gc font-semibold">
+         <img ...>
+         <div class="mr-1">
+             nieder
+         </div>
+         <svg ...star...>...</svg>
+      </div>
+
+    Возвращаем список TipOnMatch.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    tips: List[TipOnMatch] = []
+
+    # На странице матча может быть несколько tip'ов.
+    # Ориентируемся на большие блоки с исходом (selection) и автором рядом.
+    # Будем искать сначала все крупные заголовки исходов.
+    selection_divs = soup.find_all(
+        "div",
+        class_=lambda x: x
+        and "font-gc" in x.split()
+        and "font-bold" in x.split()
+        and "h-[48px]" in x.split()
     )
 
-    for block in tip_blocks:
-        link_tag = block.find("a", href=True)
-        if not link_tag:
+    # Попробуем заранее выдрать коэффициенты, если есть.
+    # Часто рядом есть текст "odds 1.95" или похожее.
+    def extract_nearby_odds(block: BeautifulSoup) -> Optional[float]:
+        # ищем в пределах того же родительского блока слово "odds" и число рядом
+        parent = block.parent
+        if not parent:
+            return None
+        text = parent.get_text(" ", strip=True)
+        text = text.replace(",", ".")
+        # ищем подстроку вида "odds 1.95" или просто число около "odds"
+        m = re.search(r"odds\s+(\d+(?:\.\d+)?)", text, flags=re.IGNORECASE)
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                return None
+        # fallback — любое правдоподобное число
+        tokens = text.split()
+        for tok in reversed(tokens):
+            try:
+                val = float(tok)
+                if 1.01 <= val <= 100.0:
+                    return val
+            except ValueError:
+                continue
+        return None
+
+    # Для поиска автора будем смотреть дальше по соседям после блока с исходом.
+    for sel_div in selection_divs:
+        selection_raw = sel_div.get_text(strip=True)
+        if not selection_raw:
             continue
 
-        href = link_tag["href"]  # например: "football/macarthur-fc-vs-newcastle-jets"
+        # Ищем блоки после selection_div, где есть "by" и далее имя + звезда
+        author_name = None
+        author_slug = None
 
-        # Полный URL tip'а
-        if href.startswith("http"):
-            tip_url = href
+        # поднимаемся до контейнера tip'а
+        container = sel_div
+        for _ in range(5):
+            if container.parent is None:
+                break
+            container = container.parent
+
+        # внутри контейнера ищем текст "by" и блок с именем
+        by_label = None
+        for small in container.find_all("div"):
+            txt = small.get_text(" ", strip=True).lower()
+            if " by" in txt and "hour" in txt or "minute" in txt or "day" in txt:
+                by_label = small
+                break
+
+        if by_label:
+            # имя автора обычно в следующем div c классами text-red-felix ...
+            author_block = by_label.find_next(
+                "div",
+                class_=lambda x: x
+                and "flex" in x.split()
+                and "items-center" in x.split()
+                and "text-red-felix" in x
+            )
         else:
-            tip_url = "https://www.bettingexpert.com/" + href.lstrip("/")
+            author_block = None
 
-        # sport – первая часть пути
-        sport = None
-        if "/" in href:
-            sport = href.split("/", 1)[0].lower()
+        if author_block:
+            # сам текст имени в первом <div class="mr-1">...</div>
+            name_div = author_block.find(
+                "div",
+                class_=lambda x: x and "mr-1" in x.split()
+            )
+            if name_div:
+                author_name = name_div.get_text(strip=True)
 
-        # Название матча: "Macarthur FC-Newcastle Jets"
-        match_span = link_tag.find("span")
-        if not match_span:
+            # slug берём из ссылки /user/profile/<slug>
+            a_profile = author_block.find("a", href=True)
+            if a_profile:
+                href = a_profile["href"]
+                # ожидаем что-то вроде "/user/profile/nieder"
+                m_slug = re.search(r"/user/profile/([^/?#]+)", href)
+                if m_slug:
+                    author_slug = m_slug.group(1)
+
+        if not author_name or not author_slug:
+            # если не нашли автора — пропускаем такой tip
             continue
 
-        match_raw = match_span.get_text(strip=True)
-        if "-" in match_raw:
-            home_raw, away_raw = match_raw.split("-", 1)
-            home_team = home_raw.strip()
-            away_team = away_raw.strip()
-            match_name = f"{home_team} vs {away_team}"
-        else:
-            home_team = None
-            away_team = None
-            match_name = match_raw
+        # Коэффициент
+        odds = extract_nearby_odds(sel_div)
 
-        # selection – синий жирный текст после флага
-        selection_span = block.find(
-            lambda tag: tag.name == "span"
-            and "font-ms" in tag.get("class", [])
-            and "font-bold" in tag.get("class", [])
-            and "text-blue-felix" in tag.get("class", [])
+        # Нормализованный ключ исхода для группировки
+        group_key = normalize_selection_for_grouping(selection_raw)
+
+        # Пока время матча сюда не подмешиваем, используем при сборке сигналов
+        tip = TipOnMatch(
+            match_url=match_url,
+            match_title=match_title,
+            kickoff_utc=None,  # заполним позже, из списка матчей по времени
+            selection_raw=selection_raw,
+            selection_group_key=group_key,
+            author_slug=author_slug,
+            author_name=author_name,
+            author_winrate=None,  # позже подтянем из профиля
+            odds=odds,
         )
-        if not selection_span:
-            continue
-        selection = selection_span.get_text(strip=True)
-        
-        # Период / тайм (если есть в описании ставки)
-        period = None
-        sel_lower = selection.lower()
-        if "1st half" in sel_lower or "first half" in sel_lower:
-            period = "1 тайм"
-        elif "2nd half" in sel_lower or "second half" in sel_lower:
-            period = "2 тайм"
-        elif "1st quarter" in sel_lower or "first quarter" in sel_lower:
-            period = "1 четверть"
-        elif "2nd quarter" in sel_lower or "second quarter" in sel_lower:
-            period = "2 четверть"
-        elif "3rd quarter" in sel_lower or "third quarter" in sel_lower:
-            period = "3 четверть"
-        elif "4th quarter" in sel_lower or "fourth quarter" in sel_lower:
-            period = "4 четверть"
-
-        # odds – из блока с текстом "odds ... 1.93"
-        odds_span = block.find(
-            lambda tag: tag.name == "span"
-            and "uppercase" in tag.get("class", [])
-            and "odds" in tag.get_text(strip=True).lower()
-        )
-        odds = None
-        if odds_span:
-            tokens = odds_span.get_text(" ", strip=True).replace(",", ".").split()
-            for token in reversed(tokens):
-                try:
-                    val = float(token)
-                    if 1.01 <= val <= 100.0:
-                        odds = val
-                        break
-                except ValueError:
-                    continue
-                    
-        # Результат ставки (для завершённых ставок, с серым фоном и ярлыком Won/Lost/Void)
-        result = None
-
-        result_badge = block.find(
-            lambda tag: tag.name == "div"
-            and "w-[36px]" in tag.get("class", [])
-            and "font-gc" in tag.get("class", [])
-        )
-        if result_badge:
-            span = result_badge.find("span")
-            if span:
-                text = span.get_text(strip=True).lower()
-                if text == "won":
-                    result = "won"
-                elif text == "lost":
-                    result = "lost"
-                elif text in ("void", "returned", "refunded", "push"):
-                    result = "void"
-                else:
-                    result = text
-
-        author = profile_name
-
-        tips.append(
-            {
-                "match": match_name,
-                "home_team": home_team,
-                "away_team": away_team,
-                "sport": sport,
-                "selection": selection,
-                "period": period, 
-                "odds": odds,
-                "author": author,
-                "tip_url": tip_url,
-                "result": result,  # <-- добавили результат
-            }
-        )
+        tips.append(tip)
 
     return tips
-# ===== 6. Время начала матча: страница tip'а bettingexpert =====
+# ===== 8. Парсинг профиля автора: Win rate =====
 
-def parse_bettingexpert_author_winrate(html: str) -> float | None:
+def parse_author_winrate(html: str) -> Optional[float]:
     """
-    Парсит процент побед (Win rate) с профиля bettingexpert.
-    Возвращает число в процентах, например 51.37, или None, если не нашёл.
+    Из HTML профиля tipster'а достаём Win rate в процентах.
+
+    В твоём примере вокруг Win rate примерно такая структура:
+
+      ... (иконка шестерёнки/шилда)
+      <div class="font-be text-xl flex flex-row items-center">
+          47.94%
+      </div>
+      <div class="text-grey4 text-xs font-gc">
+          Win rate
+      </div>
+
+    Стратегия:
+      - Находим элемент, где текст ровно "Win rate"
+      - Смотрим предыдущий соседний блок (div), берём оттуда число с %
     """
     soup = BeautifulSoup(html, "html.parser")
 
-    # Ищем элемент, где текст ровно "Win rate"
     label = soup.find(
         lambda tag: tag.name in ("div", "span")
         and tag.get_text(strip=True).lower() == "win rate"
@@ -398,669 +515,406 @@ def parse_bettingexpert_author_winrate(html: str) -> float | None:
     if not label or not label.parent:
         return None
 
-    # Вёрстка такая, что число с процентом — соседний div до подписи
+    # будем искать предыдущий div с числом
     prev = label.previous_sibling
-    # пропускаем текстовые узлы и пустяки
     while prev is not None and getattr(prev, "name", None) is None:
         prev = prev.previous_sibling
+
+    if not prev:
+        # попробуем родителя и его предыдущий элемент
+        prev = label.parent.previous_sibling
+        while prev is not None and getattr(prev, "name", None) is None:
+            prev = prev.previous_sibling
 
     if not prev:
         return None
 
     text = prev.get_text(" ", strip=True)
+    # Ищем что-то вроде "47.94%" или "52 %"
     m = re.search(r"(\d+(?:[.,]\d+)?)\s*%", text)
     if not m:
         return None
 
-    val = m.group(1).replace(",", ".")
+    val_str = m.group(1).replace(",", ".")
     try:
-        return float(val)
+        val = float(val_str)
     except ValueError:
         return None
 
-def parse_kickoff_from_tip_html(html: str) -> datetime | None:
-    """
-    Пытается вытащить из HTML страницы tip'а дату и время матча.
-    Ищем паттерны вроде "2 Apr 10:35" или "02 April 18:00".
-    Возвращаем datetime с таймзоной BETTINGEXPERT_TZ.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text(" ", strip=True)
-
-    # Пример: "2 Apr 10:35" / "02 April 10:35"
-    pattern = r"\b(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{1,2}):(\d{2})\b"
-    match = re.search(pattern, text)
-    if not match:
-        # fallback: есть только время HH:MM – считаем, что матч сегодня
-        m_time = re.search(r"\b(\d{1,2}):(\d{2})\b", text)
-        if not m_time:
-            return None
-        hour = int(m_time.group(1))
-        minute = int(m_time.group(2))
-        now = datetime.now(BETTINGEXPERT_TZ)
-        try:
-            return datetime(
-                now.year, now.month, now.day, hour, minute, tzinfo=BETTINGEXPERT_TZ
-            )
-        except ValueError:
-            return None
-
-    day_str, month_str, hour_str, minute_str = match.groups()
-    day = int(day_str)
-    month = MONTHS_EN.get(month_str.lower())
-    if not month:
+    # ограничим разумными пределами
+    if val < 0.0 or val > 100.0:
         return None
 
-    hour = int(hour_str)
-    minute = int(minute_str)
-
-    now = datetime.now(BETTINGEXPERT_TZ)
-    year = now.year
-
-    try:
-        dt_local = datetime(year, month, day, hour, minute, tzinfo=BETTINGEXPERT_TZ)
-    except ValueError:
-        return None
-
-    # Если дата ушла далеко в прошлое – пробуем следующий год (редкий кейс)
-    if dt_local < now - timedelta(days=7):
-        try:
-            dt_local = dt_local.replace(year=year + 1)
-        except ValueError:
-            pass
-
-    return dt_local
+    return val
 
 
-def get_kickoff_time_from_bettingexpert_tip(tip_url: str) -> datetime | None:
+def get_author_winrate(state: dict, author_slug: str, author_name: str) -> Optional[float]:
     """
-    Скачивает страницу tip'а bettingexpert и возвращает время начала матча в UTC.
-    """
-    try:
-        tip_html = fetch_page(tip_url)
-    except Exception as e:
-        print(f"[ERROR] Не удалось скачать tip {tip_url}: {e}")
-        return None
+    Берём Win rate автора с кэшем в state.json.
 
-    dt_local = parse_kickoff_from_tip_html(tip_html)
-    if not dt_local:
-        print(f"[WARN] Не удалось распарсить время начала матча из {tip_url}")
-        return None
-
-    # Переводим в UTC
-    if dt_local.tzinfo is None:
-        dt_local = dt_local.replace(tzinfo=BETTINGEXPERT_TZ)
-    return dt_local.astimezone(timezone.utc)
-# ===== 7. Память по будущим матчам (upcoming_matches) =====
-
-def compute_win_chance_from_winrate_only(state: dict, authors: list[str]) -> float | None:
-    """
-    Вероятность ставки, считая только текущий win rate авторов (как на сайте),
-    без учёта серий и "грязности".
-    """
-    author_stats = state.get("author_stats") or {}
-    ps: list[float] = []
-
-    for author in authors:
-        stats = author_stats.get(author)
-        if not stats:
-            continue
-        wr = stats.get("win_rate_percent")
-        if not isinstance(wr, (int, float)):
-            continue
-
-        p = max(0.0, min(1.0, float(wr) / 100.0))
-        ps.append(p)
-
-    if not ps:
-        return None
-
-    prod_p = 1.0
-    prod_not = 1.0
-    for p in ps:
-        prod_p *= p
-        prod_not *= (1.0 - p)
-
-    denom = prod_p + prod_not
-    if denom <= 0.0:
-        return None
-
-    chance = prod_p / denom
-    return chance * 100.0
-
-def compute_min_odds_for_target_profit(win_chance_percent: float) -> float | None:
-    """
-    Считает минимальный средний коэффициент k по формуле:
-      1) t = D / (f * n)
-      2) k = 1 + (t + (1 - p)) / p
-
-    p — вероятность выигрыша (0..1), win_chance_percent — в процентах (0..100).
-    Возвращает k или None, если p некорректна.
-    """
-    if not isinstance(win_chance_percent, (int, float)):
-        return None
-
-    p = float(win_chance_percent) / 100.0
-    if p <= 0.0 or p >= 1.0:
-        return None
-
-    f = BANK_FRACTION_PER_BET
-    n = BETS_PER_DAY
-    D = TARGET_DAILY_PROFIT
-
-    if f <= 0.0 or n <= 0 or D <= 0.0:
-        return None
-
-    # Шаг 1: средняя прибыль с одной ставки в долях банка
-    t = D / (f * n)
-
-    # Шаг 2: минимальный коэффициент
-    k = 1.0 + (t + (1.0 - p)) / p
-    return k
-
-def update_upcoming_matches(state: dict, tips: list[dict]) -> None:
-    """
-    Обновляет state["upcoming_matches"] по новым прогнозам.
-    Держим матчи до 7 дней вперёд.
-
-    Ключ матча: "<match>|||<selection>"
-    (т.е. конкретный матч + конкретный выбор, независимо от коеффа).
-    """
-    upcoming = state.setdefault("upcoming_matches", {})
-    now_utc = datetime.now(timezone.utc)
-    max_ahead = timedelta(days=7)
-
-    for tip in tips:
-        match = tip.get("match")
-        selection = tip.get("selection")
-        author = tip.get("author")
-        kickoff = tip.get("kickoff_time_utc")
-        odds = tip.get("odds")
-        period = tip.get("period")  # <-- вот ЗДЕСЬ добавляем
-
-        if not match or not selection or not author or not kickoff:
-            continue
-
-        try:
-            kickoff_dt = datetime.fromisoformat(kickoff)
-        except Exception:
-            continue
-
-        if kickoff_dt.tzinfo is None:
-            kickoff_dt = kickoff_dt.replace(tzinfo=timezone.utc)
-
-        delta = kickoff_dt - now_utc
-        if not (timedelta(0) <= delta <= max_ahead):
-            # слишком далеко или уже прошло
-            continue
-
-        # Нормализуем selection для группировки похожих ставок
-        norm_selection = normalize_selection_for_grouping(selection)
-        key = f"{match}|||{norm_selection}"
-
-        if key not in upcoming:
-            upcoming[key] = {
-                "match": match,
-                "selection": norm_selection,   # базовый вариант для группы
-                "period": period,
-                "kickoff": kickoff,   # ISO‑строка в UTC
-                "authors": [],
-                "author_selections": {},  # выборы по авторам
-                "odds_list": [],
-                "notified": False,
-            }
-
-        # Обновляем список авторов и коэффициентов
-        if author not in upcoming[key]["authors"]:
-            upcoming[key]["authors"].append(author)
-        if isinstance(odds, (int, float)):
-            upcoming[key]["odds_list"].append(odds)
-
-        # Сохраняем ИМЕННО его исход (чтобы позже показать -2 или -3)
-        author_selections = upcoming[key].setdefault("author_selections", {})
-        author_selections[author] = selection
-
-        authors_list = upcoming[key]["authors"]
-
-        # 1) Чистый winrate (не учитывает серии)
-        chance_pure = compute_win_chance_from_winrate_only(state, authors_list)
-        if isinstance(chance_pure, (int, float)):
-            upcoming[key]["win_chance_pure_percent"] = chance_pure
-
-def update_author_bets(state: dict, tips: list[dict]) -> None:
-    """
-    Обновляет state["bets_by_author"] по завершённым ставкам (есть result).
-
-    Структура:
-      state["bets_by_author"] = {
-        "Pacopick": {
-          "https://www.bettingexpert.com/...": {
-              "match": "...",
-              "selection": "...",
-              "odds": 1.93,
-              "result": "won" | "lost" | "void" | др.,
-              "kickoff": "2026-03-29T12:00:00+00:00",
-              "updated_at": "2026-03-29T10:15:00+00:00",
-          },
-          ...
-        },
-        "Dyole": {
-          ...
+    state["authors"] имеет структуру:
+      {
+        "<slug>": {
+          "name": "...",
+          "winrate_percent": 47.94,
+          "updated_at": <timestamp>
         },
         ...
       }
-    tip_url используем как уникальный ключ ставки для автора.
+
+    Если в кэше есть запись свежее 6 часов — возвращаем её.
+    Иначе скачиваем профиль, парсим Win rate, обновляем кэш.
     """
-    bets_by_author = state.setdefault("bets_by_author", {})
-    now_iso = datetime.now(timezone.utc).isoformat()
+    authors_cache: Dict[str, dict] = state.setdefault("authors", {})
+    now_ts = time.time()
+    max_age_seconds = 6 * 60 * 60  # 6 часов
 
-    for tip in tips:
-        author = tip.get("author")
-        tip_url = tip.get("tip_url")
-        result = tip.get("result")
+    entry = authors_cache.get(author_slug)
+    if entry:
+        updated_at = entry.get("updated_at", 0)
+        if now_ts - updated_at <= max_age_seconds:
+            wr = entry.get("winrate_percent")
+            if isinstance(wr, (int, float)):
+                return float(wr)
 
-        # Нужны автор, url и непустой result (won/lost/void/...)
-        if not author or not tip_url or not result:
+    # нужно обновить из сети
+    profile_url = f"{BASE_URL}/user/profile/{author_slug}"
+    try:
+        html = fetch_page(profile_url)
+    except Exception as e:
+        print(f"[WARN] Не удалось скачать профиль автора {author_slug}: {e}")
+        return None
+
+    winrate = safe_parse_author_winrate(html, author_slug)
+    if winrate is not None:
+        authors_cache[author_slug] = {
+            "name": author_name,
+            "winrate_percent": float(winrate),
+            "updated_at": now_ts,
+        }
+        # не забываем сохранять state снаружи (вызывающий код сделает save_state)
+
+    return winrate
+
+# ===== 13. Безопасные обёртки вокруг парсеров (логирование) =====
+
+def safe_parse_today_matches(html: str) -> List[Tuple[str, str, str]]:
+    try:
+        matches = safe_parse_today_matches(html)
+        return matches
+    except Exception as e:
+        print(f"[ERROR] Ошибка парсинга списка матчей: {e}")
+        return []
+
+
+def safe_parse_match_tips(html: str, match_url: str, match_title: str) -> List[TipOnMatch]:
+    try:
+        tips = parse_match_tips(html, match_url, match_title)
+        return tips
+    except Exception as e:
+        print(f"[ERROR] Ошибка парсинга tip'ов для матча {match_url}: {e}")
+        return []
+
+
+def safe_parse_author_winrate(html: str, slug: str) -> Optional[float]:
+    try:
+        return parse_author_winrate(html)
+    except Exception as e:
+        print(f"[ERROR] Ошибка парсинга winrate автора {slug}: {e}")
+        return None
+
+# ===== 9. Сбор ставок по всем матчам на сегодня =====
+
+def collect_today_tips_with_winrates(state: dict) -> List[TipOnMatch]:
+    """
+    Главная функция сбора:
+      - грузим TODAY_FOOTBALL_URL
+      - парсим список матчей
+      - для каждого матча:
+          - грузим страницу матча
+          - парсим все tip'ы (TipOnMatch)
+          - подставляем kickoff_utc из списка матчей
+          - для каждого автора подтягиваем Win rate (с кэшем)
+      - возвращаем общий список всех TipOnMatch за сегодня
+    """
+    print(f"[INFO] Загружаем список сегодняшних матчей: {TODAY_FOOTBALL_URL}")
+    try:
+        html = fetch_page(TODAY_FOOTBALL_URL)
+    except Exception as e:
+        print(f"[ERROR] Не удалось загрузить список матчей: {e}")
+        return []
+
+    matches = parse_today_matches(html)
+    print(f"[INFO] Найдено матчей на сегодня: {len(matches)}")
+
+    all_tips: List[TipOnMatch] = []
+
+    for rel_url, match_title, kickoff_str in matches:
+        kickoff_utc = parse_kickoff_datetime_today(kickoff_str)
+        print(f"[INFO] Матч: {match_title} ({rel_url}), время {kickoff_str}, utc={kickoff_utc}")
+
+        try:
+            match_html = fetch_page(rel_url)
+        except Exception as e:
+            print(f"[WARN] Не удалось загрузить страницу матча {rel_url}: {e}")
             continue
 
-        author_bets = bets_by_author.setdefault(author, {})
+        tips = safe_parse_match_tips(match_html, rel_url, match_title)
+        if not tips:
+            continue
 
-        # Обновляем/создаём запись по конкретной ставке
-        author_bets[tip_url] = {
-            "match": tip.get("match"),
-            "selection": tip.get("selection"),
-            "odds": tip.get("odds"),
-            "result": result,
-            "kickoff": tip.get("kickoff_time_utc"),
-            "updated_at": now_iso,
-        }
-# ===== 8. Обработка отложенных матчей и отправка уведомлений =====
+        if len(tips) < MIN_TIPS_PER_MATCH:
+            print(f"[INFO] Матч {match_title} ({rel_url}) пропущен: мало tip'ов ({len(tips)})")
+            continue
 
-def get_author_loss_streak(state: dict, author: str) -> int:
+        # Для каждого tip'а достанем/обновим winrate автора и выставим время матча
+        for tip in tips:
+            tip.kickoff_utc = kickoff_utc
+
+            wr = get_author_winrate(state, tip.author_slug, tip.author_name)
+            tip.author_winrate = wr
+
+        all_tips.extend(tips)
+
+        # после обработки каждого матча сразу сохраняем state (кэш winrate авторов)
+        save_state(state)
+
+    print(f"[INFO] Собрано всего tip'ов за сегодня: {len(all_tips)}")
+    return all_tips
+# ===== 10. Группировка ставок и расчёт комбинированной вероятности =====
+
+def group_tips_to_signals(tips: List[TipOnMatch]) -> List[Signal]:
     """
-    Возвращает длину текущей серии неудач автора:
-      - считаем с последней ставки назад,
-      - "won" обрывает серию,
-      - "lost" и прочие (кроме "void") увеличивают,
-      - "void" просто пропускаем.
+    На входе: все TipOnMatch за сегодня (с уже заполненным author_winrate и kickoff_utc).
+    Задача:
+      - сгруппировать по (match_url, selection_group_key)
+      - внутри группы взять всех авторов с известным winrate
+      - посчитать комбинированную вероятность:
+          p_i = winrate_i / 100
+          P = 1 - Π(1 - p_i)
+      - отфильтровать только те группы, где:
+          - авторов с winrate >= MIN_AUTHORS_PER_SIGNAL
+          - P * 100 >= WINRATE_THRESHOLD_PERCENT
+    Возвращаем список Signal.
     """
-    bets_by_author = state.get("bets_by_author") or {}
-    author_bets = bets_by_author.get(author) or {}
+    # 1) склеиваем по ключу (match_url, selection_group_key)
+    grouped: Dict[Tuple[str, str], List[TipOnMatch]] = {}
+    for tip in tips:
+        if not tip.selection_group_key:
+            continue
+        key = (tip.match_url, tip.selection_group_key)
+        grouped.setdefault(key, []).append(tip)
 
-    if not author_bets:
-        return 0
+    signals: List[Signal] = []
 
-    # сортируем ставки с новейших к старым по kickoff (если есть) или updated_at
-    def parse_dt(s: str | None) -> datetime:
-        if not s:
-            return datetime.min.replace(tzinfo=timezone.utc)
-        try:
-            dt = datetime.fromisoformat(s)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt
-        except Exception:
-            return datetime.min.replace(tzinfo=timezone.utc)
+    for (match_url, group_key), group_tips in grouped.items():
+        # отфильтруем авторов, у кого есть winrate
+        probs: List[float] = []
+        authors: List[str] = []
+        selections_raw: List[str] = []
 
-    bets = list(author_bets.values())
-    bets.sort(
-        key=lambda b: (
-            parse_dt(b.get("kickoff")),
-            parse_dt(b.get("updated_at")),
-        ),
+        match_title = group_tips[0].match_title
+        kickoff_utc = group_tips[0].kickoff_utc
+
+        for tip in group_tips:
+            if tip.author_winrate is None:
+                continue
+            p = float(tip.author_winrate) / 100.0
+            if p <= 0.0:
+                continue
+
+            probs.append(p)
+            authors.append(tip.author_name)
+            selections_raw.append(tip.selection_raw)
+
+        if len(probs) < MIN_AUTHORS_PER_SIGNAL:
+            continue
+
+        combined_p = combine_independent_probabilities(probs)
+        combined_percent = combined_p * 100.0
+
+        if combined_percent < WINRATE_THRESHOLD_PERCENT:
+            continue
+
+        # переводим время в московский, если есть
+        kickoff_moscow = None
+        if kickoff_utc is not None:
+            kickoff_moscow = kickoff_utc.astimezone(MOSCOW_TZ)
+
+        signal = Signal(
+            match_url=match_url,
+            match_title=match_title,
+            kickoff_utc=kickoff_utc,
+            kickoff_moscow=kickoff_moscow,
+            selection_group_key=group_key,
+            selections_raw=selections_raw,
+            authors=authors,
+            combined_win_chance_percent=combined_percent,
+        )
+        signals.append(signal)
+
+    return signals
+# ===== 11. Форматирование сигнала и отправка в Telegram =====
+
+def format_signal_message(sig: Signal) -> str:
+    """
+    Делаем короткое сообщение по твоей структуре:
+
+      матч
+      время матча
+      ставки (каждая с новой строки, без имён авторов)
+      процент победы
+
+    Пример:
+
+      ND Triglav vs NK Krka
+      Время: 17:00 (МСК)
+
+      Ставки:
+      NK Krka +0.75 (AH)
+      NK Krka +0.75 (AH)
+      NK Krka win
+
+      Комбинированный шанс: 99.3%
+
+    """
+    lines: List[str] = []
+
+    # 1) матч
+    lines.append(sig.match_title)
+
+    # 2) время матча (если смогли определить)
+    if sig.kickoff_moscow is not None:
+        local_str = sig.kickoff_moscow.strftime("%H:%M %d.%m.%Y")
+        lines.append(f"Время: {local_str} (МСК)")
+    elif sig.kickoff_utc is not None:
+        utc_str = sig.kickoff_utc.strftime("%H:%M %d.%m.%Y UTC")
+        lines.append(f"Время: {utc_str}")
+    else:
+        lines.append("Время: неизвестно")
+
+    lines.append("")  # пустая строка
+
+    # 3) ставки (подряд без имён авторов)
+    lines.append("Ставки:")
+    # чтобы не было дубликатов по 10 раз — слегка уберём повторы, но сохраним порядок
+    seen = set()
+    for sel in sig.selections_raw:
+        if sel not in seen:
+            seen.add(sel)
+            lines.append(sel)
+
+    lines.append("")  # пустая строка
+
+    # 4) процент победы
+    chance_str = f"{sig.combined_win_chance_percent:.2f}%"
+    lines.append(f"Комбинированный шанс: {chance_str}")
+
+    # Можно добавить ссылку на матч
+    full_match_url = BASE_URL + sig.match_url
+    lines.append(full_match_url)
+
+    return "\n".join(lines)
+
+
+def send_signals_to_telegram(signals: List[Signal], state: dict) -> None:
+    """
+    Отправляем все новые сигналы в Telegram.
+    Чтобы не спамить одинаковым матчем/исходом — запоминаем отправленные сигналы в state.
+    Ключ: match_url + selection_group_key + дата.
+
+    Дополнительно: ограничиваем общее число сигналов в день MAX_SIGNALS_PER_DAY.
+    """
+    sent_signals: Dict[str, dict] = state.setdefault("sent_signals", {})
+
+    today_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    day_bucket: Dict[str, bool] = sent_signals.setdefault(today_key, {})
+
+    already_sent_count = len(day_bucket)
+    remaining = max(0, MAX_SIGNALS_PER_DAY - already_sent_count)
+
+    if remaining <= 0:
+        print(f"[INFO] Дневной лимит сигналов ({MAX_SIGNALS_PER_DAY}) уже исчерпан.")
+        return
+
+    # Чтобы сначала отправлять самые сильные – отсортируем по убыванию шанса
+    signals_sorted = sorted(
+        signals,
+        key=lambda s: s.combined_win_chance_percent,
         reverse=True,
     )
 
-    streak = 0
-    for bet in bets:
-        res = (bet.get("result") or "").lower()
-        if res == "won":
+    sent_now = 0
+
+    for sig in signals_sorted:
+        if sent_now >= remaining:
+            print(f"[INFO] Достигнут лимит отправки сигналов на сегодня: {MAX_SIGNALS_PER_DAY}")
             break
-        if res in ("void", "returned", "refunded", "push"):
-            # возвраты не считаем ни за win, ни за lose
-            continue
-        # всё, что не win и не void — считаем как неудачу
-        streak += 1
 
-    return streak
-    
-def update_author_stats(state: dict, author: str, win_rate: float | None) -> None:
-    """
-    Обновляет state["author_stats"] для конкретного автора.
-
-    Структура:
-      state["author_stats"] = {
-        "Pacopick": {
-          "win_rate_percent": 53.21,
-          "updated_at": "2026-03-29T17:45:00+00:00"
-        },
-        "Dyole": {
-          ...
-        },
-        ...
-      }
-    """
-    stats = state.setdefault("author_stats", {})
-    author_entry = stats.setdefault(author, {})
-
-    # обновляем win rate, только если он распарсился как число
-    if isinstance(win_rate, (int, float)):
-        author_entry["win_rate_percent"] = float(win_rate)
-
-    # фиксируем время обновления (в UTC)
-    author_entry["updated_at"] = datetime.now(timezone.utc).isoformat()
-
-def process_upcoming_matches(state: dict) -> None:
-    """
-    Проверяет state["upcoming_matches"] и отправляет уведомления,
-    если до матча сейчас от -40 до +80 минут по МСК
-    и есть минимум два разных типстера с одной и той же ставкой.
-    """
-    upcoming = state.get("upcoming_matches") or {}
-    if not upcoming:
-        return
-
-    parts: list[str] = []
-
-    for key, info in list(upcoming.items()):
-        if info.get("notified"):
+        uniq = f"{sig.match_url}||{sig.selection_group_key}"
+        if day_bucket.get(uniq):
+            # уже отправляли сегодня
             continue
 
-        match = info.get("match") or "матч неизвестен"
-        selection = info.get("selection") or "выбор не указан"
-        kickoff_str = info.get("kickoff")
-        authors = info.get("authors") or []
-        odds_list = info.get("odds_list") or []
-        period = info.get("period")  # может быть None
-        # Чистый winrate (единственный обязательный шанс)
-        chance_pure = info.get("win_chance_pure_percent")
-
-        # Если нет шанса по winrate или он < 70% — не шлём уведомление
-        if not isinstance(chance_pure, (int, float)) or chance_pure < 80.0:
-            continue
-
-
-        if not kickoff_str:
-            continue
-
+        text = format_signal_message(sig)
         try:
-            kickoff_utc = datetime.fromisoformat(kickoff_str)
-        except Exception:
-            continue
-
-        if kickoff_utc.tzinfo is None:
-            kickoff_utc = kickoff_utc.replace(tzinfo=timezone.utc)
-
-        kickoff_msk = kickoff_utc.astimezone(MOSCOW_TZ)
-
-        unique_authors = sorted(set(authors))
-        if len(unique_authors) < 2:
-            # Меньше четырех разных авторов – пропускаем
-            continue
-
-        avg_odds = sum(odds_list) / len(odds_list) if odds_list else None
-        odds_str = f"{avg_odds:.2f}" if avg_odds is not None else "—"
-
-        kickoff_human = kickoff_msk.strftime("%Y-%m-%d %H:%M")
-
-        # Карта исходов по авторам (сохранили в update_upcoming_matches)
-        author_selections = info.get("author_selections") or {}
-
-        # Для каждого автора считаем short_selection из его исхода
-        authors_lines = []
-        for author in unique_authors:
-            sel_for_author = author_selections.get(author, selection)
-            sel_short = short_selection(sel_for_author, match)
-            if period:
-                authors_lines.append(f"{author} — {sel_short} ({period})")
-            else:
-                authors_lines.append(f"{author} — {sel_short}")
-
-        authors_block = "\n".join(authors_lines)
-
-        # Формируем строки с шансами, если они посчитаны
-        lines = [
-            f"<b>Матч:</b> {match}",
-            f"Время (МСК): {kickoff_human}",
-            authors_block,
-            f"Средний кэф: {odds_str}",
-        ]
-
-        # Шанс по чистому winrate (основной)
-        lines.append(f"Шанс по winrate: {chance_pure:.1f}%")
-        
-        # Минимальный средний коэффициент для достижения целевой дневной прибыли
-        k_min = compute_min_odds_for_target_profit(chance_pure)
-        if isinstance(k_min, (int, float)):
-            lines.append(f"Мин. кэф для {int(TARGET_DAILY_PROFIT * 100)}% в день: {k_min:.2f}")
-
-        lines.append("-" * 40)
-
-        part = "\n".join(lines)
-
-        parts.append(part)
-
-        # Помечаем как уже уведомлённый, чтобы второй раз не шлём
-        info["notified"] = True
-
-    if parts:
-        full_message = "\n\n".join(parts)
-        try:
-            send_telegram_message(full_message)
-            print("[INFO] Уведомление по отложенным матчам отправлено.")
+            print(
+                f"[INFO] Отправляем сигнал по матчу {sig.match_title} "
+                f"(шанс {sig.combined_win_chance_percent:.2f}%)"
+            )
+            send_telegram_message(text)
+            day_bucket[uniq] = True
+            save_state(state)
+            sent_now += 1
         except Exception as e:
-            print(f"[ERROR] Не удалось отправить сообщение по отложенным матчам: {e}")
+            print(f"[ERROR] Не удалось отправить сигнал в Telegram: {e}")
 
-def process_night_matches_summary(state: dict) -> None:
+def run_single_iteration() -> None:
     """
-    В 23:00 по МСК отправляет одно сообщение со всеми ночными матчами
-    (с 00:00 до 07:00 ближайшей ночи), где:
-      - минимум 4 разных автора на одном исходе,
-      - шанс по winrate >= 55%.
+    Одна полная итерация:
+      - загружаем state.json
+      - собираем все ставки за сегодня с winrate авторов
+      - группируем в сигналы
+      - отправляем новые сигналы в Telegram
     """
-    upcoming = state.get("upcoming_matches") or {}
-    if not upcoming:
-        return
+    print("=" * 60)
+    print(f"[INFO] Запуск проверки в {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S %d.%m.%Y (%Z)')}")
 
-    now_msk = datetime.now(MOSCOW_TZ)
-    # шлём резюме только в 23-й час
-    if now_msk.hour != 23:
-        return
-
-    today_str = now_msk.strftime("%Y-%m-%d")
-    last_date = state.get("night_summary_date")
-    # уже слали сегодня – выходим
-    if last_date == today_str:
-        return
-
-    # ближайшая ночь: с полуночи до 07:00 следующего календарного дня по МСК
-    night_date = (now_msk + timedelta(days=1)).date()
-
-    parts: list[str] = []
-
-    for key, info in list(upcoming.items()):
-        match = info.get("match") or "матч неизвестен"
-        selection = info.get("selection") or "выбор не указан"
-        kickoff_str = info.get("kickoff")
-        authors = info.get("authors") or []
-        odds_list = info.get("odds_list") or []
-        period = info.get("period")
-        chance_pure = info.get("win_chance_pure_percent")
-
-        if not kickoff_str:
-            continue
-
-        # шанс по winrate
-        if not isinstance(chance_pure, (int, float)) or chance_pure < 55.0:
-            continue
-
-        # минимум 4 разных автора
-        unique_authors = sorted(set(authors))
-        if len(unique_authors) < 4:
-            continue
-
-        try:
-            kickoff_utc = datetime.fromisoformat(kickoff_str)
-        except Exception:
-            continue
-
-        if kickoff_utc.tzinfo is None:
-            kickoff_utc = kickoff_utc.replace(tzinfo=timezone.utc)
-
-        kickoff_msk = kickoff_utc.astimezone(MOSCOW_TZ)
-
-        # матч должен быть в ближайшую ночь: дата = night_date и время 00:00–06:59
-        if kickoff_msk.date() != night_date:
-            continue
-        if not (0 <= kickoff_msk.hour < 7):
-            continue
-
-        avg_odds = sum(odds_list) / len(odds_list) if odds_list else None
-        odds_str = f"{avg_odds:.2f}" if avg_odds is not None else "—"
-        kickoff_human = kickoff_msk.strftime("%Y-%m-%d %H:%M")
-
-        author_selections = info.get("author_selections") or {}
-        authors_lines = []
-        for author in unique_authors:
-            sel_for_author = author_selections.get(author, selection)
-            sel_short = short_selection(sel_for_author, match)
-            if period:
-                authors_lines.append(f"{author} — {sel_short} ({period})")
-            else:
-                authors_lines.append(f"{author} — {sel_short}")
-        authors_block = "\n".join(authors_lines)
-
-        lines = [
-            f"<b>Ночной матч:</b> {match}",
-            f"Время (МСК): {kickoff_human}",
-            authors_block,
-            f"Средний кэф: {odds_str}",
-            f"Шанс по winrate: {chance_pure:.1f}%",
-            "-" * 40,
-        ]
-        parts.append("\n".join(lines))
-
-    if parts:
-        full_message = "Ночные матчи (00:00–07:00 ближайшей ночи):\n\n" + "\n\n".join(parts)
-        try:
-            send_telegram_message(full_message)
-            state["night_summary_date"] = today_str  # отмечаем, что за сегодня уже слали
-            print("[INFO] Ночное резюме по матчам отправлено.")
-        except Exception as e:
-            print(f"[ERROR] Не удалось отправить ночное резюме: {e}")
-
-# ===== 9. Один проход по всем профилям bettingexpert =====
-
-def check_profiles_once() -> None:
-    """
-    1) Загружает state.json.
-    2) Для каждого профиля bettingexpert из SITES:
-       - качает HTML профиля,
-       - парсит активные ставки,
-       - для каждой ставки тянет страницу tip'а и парсит время начала,
-       - конвертирует время в UTC.
-    3) Обновляет память по матчам (upcoming_matches).
-    4) Вызывает process_upcoming_matches (окно -40..80 мин, >=2 авторов).
-    5) Сохраняет state.json.
-    """
     state = load_state()
-    all_enriched_tips: list[dict] = []
 
-    for site in SITES:
-        name = site["name"]          # строка с именем + %: "Pacopick 53%"
-        url = site["url"]            # URL профиля
-        source = site.get("source")  # должно быть "bettingexpert"
+    tips = collect_today_tips_with_winrates(state)
+    if not tips:
+        print("[INFO] Нет tip'ов за сегодня или не удалось их собрать.")
+        return
 
-        # Вытаскиваем чистое имя автора из name, убирая "%", если нужно
-        # Например, "Pacopick 53%" -> "Pacopick"
-        author_name = name.split()[0]
+    signals = group_tips_to_signals(tips)
+    print(f"[INFO] Сформировано сигналов (до фильтра по уже отправленным): {len(signals)}")
 
-        if source != "bettingexpert":
-            print(f"[WARN] Профиль {name} не помечен как bettingexpert, пропускаю.")
-            continue
+    if not signals:
+        print("[INFO] Нет сигналов, прошедших порог вероятности и кол-во авторов.")
+        return
 
-        print(f"[INFO] Проверяю профиль: {author_name} ({url})")
+    send_signals_to_telegram(signals, state)
 
+
+def main_loop() -> None:
+    """
+    Бесконечный цикл для Railway:
+      - запускаем run_single_iteration()
+      - спим CHECK_INTERVAL_MINUTES
+    """
+    interval_sec = max(1, int(CHECK_INTERVAL_MINUTES * 60))
+    print(f"[INFO] Старт главного цикла. Интервал: {CHECK_INTERVAL_MINUTES} минут.")
+
+    while True:
         try:
-            html = fetch_page(url)
+            run_single_iteration()
         except Exception as e:
-            print(f"[ERROR] Не удалось скачать {url}: {e}")
-            continue
-            
-        try:
-            win_rate = parse_bettingexpert_author_winrate(html)
-        except Exception as e:
-            print(f"[WARN] Не удалось распарсить win rate для {author_name}: {e}")
-            win_rate = None
+            # Чтобы воркер не падал полностью из‑за одной ошибки
+            print(f"[FATAL] Необработанное исключение в итерации: {e}")
+        print(f"[INFO] Спим {CHECK_INTERVAL_MINUTES} минут...")
+        time.sleep(interval_sec)
 
-        update_author_stats(state, author_name, win_rate)
-        
-        try:
-            tips = parse_bettingexpert_tips(html, author_name, url)
-        except Exception as e:
-            print(f"[ERROR] Ошибка парсинга профиля {url}: {e}")
-            continue
-
-        print(f"[INFO] Найдено прогнозов у {author_name}: {len(tips)}")
-
-        # обогащаем ставки временем начала матча (UTC)
-        enriched: list[dict] = []
-        for tip in tips:
-            tip_url = tip.get("tip_url")
-            if not tip_url:
-                continue
-
-            kickoff_utc = get_kickoff_time_from_bettingexpert_tip(tip_url)
-            if not kickoff_utc:
-                continue
-
-            tip["kickoff_time_utc"] = kickoff_utc.isoformat()
-            enriched.append(tip)
-
-        print(
-            f"[INFO] Профиль {author_name}: ставок с известным временем матчей: "
-            f"{len(enriched)}"
-        )
-
-        all_enriched_tips.extend(enriched)
-
-    # Обновляем статистику ставок по авторам (завершённые ставки с result)
-    update_author_bets(state, all_enriched_tips)
-
-    # Обновляем память о будущих матчах (до 7 дней вперёд)
-    update_upcoming_matches(state, all_enriched_tips)
-
-    # Проверяем, есть ли матчи, попадающие в окно -40..80 минут и >=4 авторов
-    process_upcoming_matches(state)
-
-    # В 23:00 шлём ночное резюме (00:00–07:00 ближайшей ночи) при >=4 авторах
-    process_night_matches_summary(state)
-
-    # Сохраняем состояние
-    save_state(state)
-
-# ===== 10. Точка входа (главный цикл) =====
 
 if __name__ == "__main__":
-    while True:
-        now_moscow = datetime.now(MOSCOW_TZ)
-        hour = now_moscow.hour
-
-        # Ночной режим: с 00:00 до 06:59 по Москве не трогаем сайты
-        if 0 <= hour < 7:
-            print(
-                f"[INFO] {now_moscow.strftime('%Y-%m-%d %H:%M')} МСК. "
-                f"Ночной режим, проверки не выполняем."
-            )
-        else:
-            print(
-                f"[INFO] Запуск проверки профилей "
-                f"(МСК: {now_moscow.strftime('%Y-%m-%d %H:%M')})..."
-            )
-            try:
-                check_profiles_once()
-            except Exception as e:
-                print(f"[ERROR] Критическая ошибка в check_profiles_once: {e}")
-
-        print(f"[INFO] Сон {CHECK_INTERVAL_MINUTES} минут до следующей проверки...")
-        time.sleep(CHECK_INTERVAL_MINUTES * 60)
+    main_loop()
