@@ -380,6 +380,19 @@ def parse_match_tips(html: str, match_url: str, match_title: str) -> List[TipOnM
 
     # Попробуем заранее выдрать коэффициенты, если есть.
     # Часто рядом есть текст "odds 1.95" или похожее.
+
+    def safe_parse_match_tips(html: str, match_url: str, match_title: str) -> List[TipOnMatch]:
+    """
+    Безопасный парсер tip'ов: ловим исключения, чтобы из-за одного матча
+    не падала вся итерация.
+    """
+    try:
+        tips = parse_match_tips(html, match_url, match_title)
+        return tips
+    except Exception as e:
+        print(f"[ERROR] Ошибка парсинга tip'ов для матча {match_url}: {e}")
+        return []
+
     def extract_nearby_odds(block: BeautifulSoup) -> Optional[float]:
         # ищем в пределах того же родительского блока слово "odds" и число рядом
         parent = block.parent
