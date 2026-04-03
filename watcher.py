@@ -185,7 +185,11 @@ def combine_independent_probabilities(ps: List[float]) -> float:
 
 def normalize_selection_for_grouping(selection: str) -> str:
     """
-    Нормализует исход ставки для группировки похожих.
+    Нормализует исход ставки для группировки похожих:
+      - Over/Under по матчу и по таймам больше НЕ склеиваются:
+          "Over 2.5 goals"    -> "Over goals"
+          "Over 1.5 goals 1st half" -> "Over goals 1H"
+      - Остальная логика как раньше.
     """
     if not selection:
         return ""
@@ -193,47 +197,56 @@ def normalize_selection_for_grouping(selection: str) -> str:
     text = selection.strip()
     lower = text.lower()
 
+    # Определяем тайм, чтобы не склеивать матч и таймы
+    half_suffix = ""
+    if re.search(r"\b(1st half|first half|1h|ht)\b", lower):
+        half_suffix = " 1H"
+    elif re.search(r"\b(2nd half|second half|2h)\b", lower):
+        half_suffix = " 2H"
+
     # Draw No Bet
     m_dnb = re.match(r"(.+?)\s+to\s+win\s+draw\s+no\s+bet", lower)
     if m_dnb:
         team = m_dnb.group(1).strip()
-        return f"{team} DNB"
+        return f"{team} DNB{half_suffix}"
 
-    # Over / Under goals
+    # Over / Under goals (полный рынок «goals»)
     m_over = re.match(r"\s*over\s+[\d.,]+\s+goals?", lower)
     if m_over:
-        return "Over goals"
+        return f"Over goals{half_suffix}"
 
     m_under = re.match(r"\s*under\s+[\d.,]+\s+goals?", lower)
     if m_under:
-        return "Under goals"
+        return f"Under goals{half_suffix}"
 
     # Азиатский гандикап с командой
     m_ah_team = re.match(r"(.+?)\s+[+-]?\d+(\.\d+)?\s*\(ah\)", text, flags=re.IGNORECASE)
     if m_ah_team:
         team = m_ah_team.group(1).strip()
-        return f"{team} (AH)"
+        return f"{team} (AH){half_suffix}"
 
     # Азиатский гандикап без команды
     m_ah = re.match(r"[+-]?\d+(\.\d+)?\s*\(ah\)", text, flags=re.IGNORECASE)
     if m_ah:
-        return "+(AH)"
+        return f"+(AH){half_suffix}"
 
-    # Team to win
+    # Team to win (полный матч; если в тексте будет "1st half",
+    # это выражение скорее всего не сработает и вернём текст как есть)
     m_win = re.match(r"(.+?)\s+to\s+win\b", text, flags=re.IGNORECASE)
     if m_win:
         team = m_win.group(1).strip()
-        return f"{team} win"
+        return f"{team} win{half_suffix}"
 
-    # Over / Under без goals
+    # Тоталы без слова goals: "Over 167.5 points", "Over 2.5"
     m_over_any = re.match(r"\s*over\s+[\d.,]+", lower)
     if m_over_any:
-        return "Over"
+        return f"Over{half_suffix}"
 
     m_under_any = re.match(r"\s*under\s+[\d.,]+", lower)
     if m_under_any:
-        return "Under"
+        return f"Under{half_suffix}"
 
+    # Если ничего не распознали — возвращаем как есть
     return text
 
 
