@@ -202,10 +202,18 @@ def combine_independent_probabilities(ps: List[float]) -> float:
 def normalize_selection_for_grouping(selection: str) -> str:
     """
     Нормализует исход ставки для группировки похожих:
-      - Over/Under по матчу и по таймам больше НЕ склеиваются:
-          "Over 2.5 goals"    -> "Over goals"
-          "Over 1.5 goals 1st half" -> "Over goals 1H"
-      - Остальная логика как раньше.
+
+      - Over/Under по матчу и по таймам НЕ склеиваются:
+          "Over 2.5 goals"          -> "Over goals"
+          "Over 1.5 goals 1st half"  -> "Over goals 1H"
+      - AH 0 для команды считается похожим на победу команды:
+          "Union 0 (AH)"   -> "Union win"
+          "Union pk (ah)"  -> "Union win"
+      - DNB тоже считается отдельным типом исхода:
+          "Union to win draw no bet" -> "Union DNB"
+
+      Эта логика работает для всех видов спорта, где используются
+      похожие текстовые формулировки (football, basketball, ice-hockey и т.д.).
     """
     if not selection:
         return ""
@@ -213,47 +221,67 @@ def normalize_selection_for_grouping(selection: str) -> str:
     text = selection.strip()
     lower = text.lower()
 
-    # Определяем тайм, чтобы не склеивать матч и таймы
+    # --- Определяем тайм / период, чтобы не склеивать матч и таймы ---
     half_suffix = ""
     if re.search(r"\b(1st half|first half|1h|ht)\b", lower):
         half_suffix = " 1H"
     elif re.search(r"\b(2nd half|second half|2h)\b", lower):
         half_suffix = " 2H"
 
-    # Draw No Bet
+    # === Draw No Bet ===
+    # Примеры: "Union to win draw no bet"
     m_dnb = re.match(r"(.+?)\s+to\s+win\s+draw\s+no\s+bet", lower)
     if m_dnb:
         team = m_dnb.group(1).strip()
         return f"{team} DNB{half_suffix}"
 
-    # Over / Under goals (полный рынок «goals»)
-    m_over = re.match(r"\s*over\s+[\d.,]+\s+goals?", lower)
-    if m_over:
-        return f"Over goals{half_suffix}"
-
-    m_under = re.match(r"\s*under\s+[\d.,]+\s+goals?", lower)
-    if m_under:
-        return f"Under goals{half_suffix}"
-
-    # Азиатский гандикап с командой
-    m_ah_team = re.match(r"(.+?)\s+[+-]?\d+(\.\d+)?\s*\(ah\)", text, flags=re.IGNORECASE)
+    # === Asian handicap с командой, включая 0 / pk ===
+    # Примеры:
+    #   "Union 0 (AH)"
+    #   "Union +0.0 (AH)"
+    #   "Union pk (ah)"
+    m_ah_team = re.match(r"(.+?)\s+([+-]?\d+(?:\.\d+)?|pk)\s*\(ah\)", text, flags=re.IGNORECASE)
     if m_ah_team:
         team = m_ah_team.group(1).strip()
+        hcp_raw = m_ah_team.group(2).strip().lower()
+
+        # 0 / pk -> считаем как победу команды
+        if hcp_raw in ("0", "+0", "-0", "0.0", "+0.0", "-0.0", "pk", "0,0", "+0,0", "-0,0"):
+            return f"{team} win{half_suffix}"
+
+        # Любой другой гандикап -> просто "Team (AH)"
         return f"{team} (AH){half_suffix}"
 
-    # Азиатский гандикап без команды
+    # === Азиатский гандикап без команды ===
+    # Пример: "+3.5 (AH)"
     m_ah = re.match(r"[+-]?\d+(\.\d+)?\s*\(ah\)", text, flags=re.IGNORECASE)
     if m_ah:
         return f"+(AH){half_suffix}"
 
-    # Team to win (полный матч; если в тексте будет "1st half",
-    # это выражение скорее всего не сработает и вернём текст как есть)
+    # === Team to win (полный матч либо конкретный период, если он явно указан) ===
+    # Примеры:
+    #   "Union to win"
+    #   "Union to win 1st half"
     m_win = re.match(r"(.+?)\s+to\s+win\b", text, flags=re.IGNORECASE)
     if m_win:
         team = m_win.group(1).strip()
         return f"{team} win{half_suffix}"
 
-    # Тоталы без слова goals: "Over 167.5 points", "Over 2.5"
+    # === Over / Under по голам/очкам (полный рынок «goals»/«points» и т.п.) ===
+    # Работает для разных видов спорта: "goals", "points", "corners" и т.д.
+    m_over_goals = re.match(r"\s*over\s+[\d.,]+\s+(goals?|points?|corners?)", lower)
+    if m_over_goals:
+        kind = m_over_goals.group(1).lower()
+        # нормализуем все в "goals" для простоты, но учитываем тайм
+        return f"Over {kind}{half_suffix}"
+
+    m_under_goals = re.match(r"\s*under\s+[\d.,]+\s+(goals?|points?|corners?)", lower)
+    if m_under_goals:
+        kind = m_under_goals.group(1).lower()
+        return f"Under {kind}{half_suffix}"
+
+    # === Тоталы без явного слова (goals/points) ===
+    # Примеры: "Over 167.5", "Under 2.5"
     m_over_any = re.match(r"\s*over\s+[\d.,]+", lower)
     if m_over_any:
         return f"Over{half_suffix}"
@@ -262,7 +290,7 @@ def normalize_selection_for_grouping(selection: str) -> str:
     if m_under_any:
         return f"Under{half_suffix}"
 
-    # Если ничего не распознали — возвращаем как есть
+    # Если ничего не распознали — возвращаем как есть (сырое название ставки)
     return text
 
 
@@ -682,6 +710,11 @@ def group_tips_to_signals(tips: List[TipOnMatch]) -> List[Signal]:
 def format_signal_message(sig: Signal) -> str:
     """
     Формируем текст сообщения для Telegram.
+    Показываем:
+      - матч
+      - время
+      - общий (комбинированный) процент
+      - список реальных ставок, которые были посчитаны как похожие
     """
     lines: List[str] = []
 
@@ -697,18 +730,19 @@ def format_signal_message(sig: Signal) -> str:
         lines.append("Время: неизвестно")
 
     lines.append("")
-    lines.append("Ставки:")
 
+    chance_str = f"{sig.combined_win_chance_percent:.2f}%"
+    lines.append(f"Комбинированный шанс: {chance_str}")
+    lines.append("")
+
+    lines.append("По следующим похожим ставкам:")
     seen = set()
     for sel in sig.selections_raw:
         if sel not in seen:
             seen.add(sel)
-            lines.append(sel)
+            lines.append(f"- {sel}")
 
     lines.append("")
-    chance_str = f"{sig.combined_win_chance_percent:.2f}%"
-    lines.append(f"Комбинированный шанс: {chance_str}")
-
     full_match_url = BASE_URL + sig.match_url
     lines.append(full_match_url)
 
