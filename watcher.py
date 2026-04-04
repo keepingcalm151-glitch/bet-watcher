@@ -752,6 +752,7 @@ def format_signal_message(sig: Signal) -> str:
 def send_signals_to_telegram(signals: List[Signal], state: dict) -> None:
     """
     Отправляем новые сигналы в Telegram (с лимитом в день).
+    Сортировка: сначала ближайшее время матча, внутри одинакового времени — по проценту.
     """
     sent_signals: Dict[str, dict] = state.setdefault("sent_signals", {})
 
@@ -765,11 +766,14 @@ def send_signals_to_telegram(signals: List[Signal], state: dict) -> None:
         print(f"[INFO] Дневной лимит сигналов ({MAX_SIGNALS_PER_DAY}) уже исчерпан.")
         return
 
-    signals_sorted = sorted(
-        signals,
-        key=lambda s: s.combined_win_chance_percent,
-        reverse=True,
-    )
+    # Новая сортировка: сначала по времени, потом по проценту
+    def sort_key(s: Signal):
+        # если нет kickoff_utc — ставим очень далёкую дату, чтобы ушли в конец
+        dt = s.kickoff_utc or datetime.max.replace(tzinfo=timezone.utc)
+        # второй ключ — минус процент (чтобы внутри одного времени сначала более высокий)
+        return (dt, -s.combined_win_chance_percent)
+
+    signals_sorted = sorted(signals, key=sort_key)
 
     sent_now = 0
 
