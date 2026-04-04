@@ -57,6 +57,22 @@ TODAY_FOOTBALL_URL: str = config.get(
     f"{BASE_URL}/football"
 )
 
+SPORT_PATH_PREFIXES = [
+    "/football/",
+    "/ice-hockey/",
+    "/basketball/",
+    "/rugby/",
+    "/handball/",
+]
+
+TODAY_SPORT_URLS: List[str] = [
+    TODAY_FOOTBALL_URL,
+    f"{BASE_URL}/ice-hockey",
+    f"{BASE_URL}/basketball",
+    f"{BASE_URL}/rugby",
+    f"{BASE_URL}/handball",
+]
+
 WINRATE_THRESHOLD_PERCENT: float = float(config.get("winrate_threshold_percent", 98.0))
 MIN_AUTHORS_PER_SIGNAL: int = int(config.get("min_authors_per_signal", 2))
 MIN_TIPS_PER_MATCH: int = int(config.get("min_tips_per_match", 1))
@@ -254,7 +270,7 @@ def normalize_selection_for_grouping(selection: str) -> str:
 
 def parse_today_matches(html: str) -> List[Tuple[str, str, str]]:
     """
-    Парсим страницу с сегодняшними матчами (например /football).
+    Парсим страницу с сегодняшними матчами (football / ice-hockey / basketball / rugby / handball).
     Возвращаем список: (relative_url, match_title, kickoff_time_str)
     """
     soup = BeautifulSoup(html, "html.parser")
@@ -262,9 +278,11 @@ def parse_today_matches(html: str) -> List[Tuple[str, str, str]]:
 
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        if not href.startswith("/football/"):
+        # принимаем только ссылки на матчи по известным видам спорта
+        if not any(href.startswith(prefix) for prefix in SPORT_PATH_PREFIXES):
             continue
 
+        # время матча
         time_div = a.find(
             "div",
             class_=lambda x: x and "font-os" in x.split() and "text-lg" in x.split()
@@ -273,6 +291,7 @@ def parse_today_matches(html: str) -> List[Tuple[str, str, str]]:
             continue
         kickoff_str = time_div.get_text(strip=True)
 
+        # команды — два div'а с font-ms + truncate
         team_divs = a.find_all(
             "div",
             class_=lambda x: x and "font-ms" in x.split() and "truncate" in x.split()
@@ -551,48 +570,49 @@ def safe_parse_author_winrate(html: str, slug: str) -> Optional[float]:
 
 def collect_today_tips_with_winrates(state: dict) -> List[TipOnMatch]:
     """
-    Главная функция сбора tip'ов за сегодня.
+    Главная функция сбора tip'ов за сегодня по всем нужным видам спорта.
     """
-    print(f"[INFO] Загружаем список сегодняшних матчей: {TODAY_FOOTBALL_URL}")
-    try:
-        html = fetch_page(TODAY_FOOTBALL_URL)
-    except Exception as e:
-        print(f"[ERROR] Не удалось загрузить список матчей: {e}")
-        return []
-
-    matches = parse_today_matches(html)
-    print(f"[INFO] Найдено матчей на сегодня: {len(matches)}")
-
     all_tips: List[TipOnMatch] = []
 
-    for rel_url, match_title, kickoff_str in matches:
-        kickoff_utc = parse_kickoff_datetime_today(kickoff_str)
-        print(f"[INFO] Матч: {match_title} ({rel_url}), время {kickoff_str}, utc={kickoff_utc}")
-
+    for listing_url in TODAY_SPORT_URLS:
+        print(f"[INFO] Загружаем список сегодняшних матчей: {listing_url}")
         try:
-            match_html = fetch_page(rel_url)
+            html = fetch_page(listing_url)
         except Exception as e:
-            print(f"[WARN] Не удалось загрузить страницу матча {rel_url}: {e}")
+            print(f"[ERROR] Не удалось загрузить список матчей {listing_url}: {e}")
             continue
 
-        tips = safe_parse_match_tips(match_html, rel_url, match_title)
-        print(f"[DEBUG] Для матча {match_title} нашли tip'ов: {len(tips)}")
-        if not tips:
-            continue
+        matches = parse_today_matches(html)
+        print(f"[INFO] Найдено матчей на сегодня ({listing_url}): {len(matches)}")
 
-        if len(tips) < MIN_TIPS_PER_MATCH:
-            print(f"[INFO] Матч {match_title} ({rel_url}) пропущен: мало tip'ов ({len(tips)})")
-            continue
+        for rel_url, match_title, kickoff_str in matches:
+            kickoff_utc = parse_kickoff_datetime_today(kickoff_str)
+            print(f"[INFO] Матч: {match_title} ({rel_url}), время {kickoff_str}, utc={kickoff_utc}")
 
-        for tip in tips:
-            tip.kickoff_utc = kickoff_utc
-            wr = get_author_winrate(state, tip.author_slug, tip.author_name)
-            tip.author_winrate = wr
+            try:
+                match_html = fetch_page(rel_url)
+            except Exception as e:
+                print(f"[WARN] Не удалось загрузить страницу матча {rel_url}: {e}")
+                continue
 
-        all_tips.extend(tips)
-        save_state(state)
+            tips = safe_parse_match_tips(match_html, rel_url, match_title)
+            print(f"[DEBUG] Для матча {match_title} нашли tip'ов: {len(tips)}")
+            if not tips:
+                continue
 
-    print(f"[INFO] Собрано всего tip'ов за сегодня: {len(all_tips)}")
+            if len(tips) < MIN_TIPS_PER_MATCH:
+                print(f"[INFO] Матч {match_title} ({rel_url}) пропущен: мало tip'ов ({len(tips)})")
+                continue
+
+            for tip in tips:
+                tip.kickoff_utc = kickoff_utc
+                wr = get_author_winrate(state, tip.author_slug, tip.author_name)
+                tip.author_winrate = wr
+
+            all_tips.extend(tips)
+            save_state(state)
+
+    print(f"[INFO] Собрано всего tip'ов за сегодня (все виды спорта): {len(all_tips)}")
     return all_tips
 
 
